@@ -6,12 +6,6 @@ import { google } from "googleapis";
 // ----- CONFIG -----
 const PORT = process.env.PORT || 3000;
 
-// Twilio (optional here, but kept for later use)
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID || "",
-  process.env.TWILIO_AUTH_TOKEN || ""
-);
-
 // Google Sheets
 const sheets = google.sheets("v4");
 
@@ -22,8 +16,7 @@ function getGoogleAuth() {
 
   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 
-  // 🔥 Very common fix when JSON is stored in environment variables
-  // (private_key comes with escaped newlines \\n)
+  // Fix escaped newlines in Render env var
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
   }
@@ -38,13 +31,11 @@ function getGoogleAuth() {
 
 // ----- PRICING LOGIC V1 -----
 function calculatePriceRange({ drives, year, location, condition }) {
-  // 1. Base price
   let min = drives ? 300 : 120;
   let max = drives ? 700 : 350;
 
   const y = parseInt(year, 10);
 
-  // 2. Year adjustment
   if (!isNaN(y)) {
     if (y >= 2015) {
       min += 100;
@@ -55,7 +46,6 @@ function calculatePriceRange({ drives, year, location, condition }) {
     }
   }
 
-  // 3. Location adjustment (very rough for now)
   const loc = (location || "").toLowerCase();
   if (/vancouver|richmond|north vancouver|coquitlam/.test(loc)) {
     min -= 30;
@@ -65,125 +55,381 @@ function calculatePriceRange({ drives, year, location, condition }) {
     max -= 50;
   }
 
-  // 4. Condition adjustment
   const cond = (condition || "").toLowerCase();
   if (/fire|flood|frame|major accident|heavy damage/.test(cond)) {
     min -= 50;
     max -= 150;
   }
 
-  // Never go below 50
   min = Math.max(min, 50);
   max = Math.max(max, min + 50);
 
-  return {
-    min: Math.round(min),
-    max: Math.round(max),
-  };
+  return { min: Math.round(min), max: Math.round(max) };
 }
 
 // ----- EXPRESS APP -----
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends x-www-form-urlencoded
 app.use(bodyParser.json());
 
-// ✅ Optional: log every request path (helps confirm Twilio is hitting your app)
+// Simple request logger
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path}`);
   next();
 });
 
-// Simple health check
 app.get("/", (req, res) => {
   res.status(200).send("CashCarBC AI backend is running.\n");
 });
 
-// Endpoint to be called by Twilio voice webhook
+// ----- CALL STATE (IN MEMORY) -----
+// NOTE: This resets if Render restarts or you redeploy.
+// Good enough for Step 1 testing.
+const callState = new Map();
+/*
+state = {
+  step: "drives" | "year" | "make" | "model" | "location" | "condition" | "done",
+  from: "",
+  to: "",
+  timestamp: "",
+  drives: true/false,
+  year: "",
+  make: "",
+  model: "",
+  location: "",
+  condition: ""
+}
+*/
+
+// Helpers
+function getOrCreateState(callSid, req) {
+  if (!callState.has(callSid)) {
+    callState.set(callSid, {
+      step: "drives",
+      from: req.body.From || "",
+      to: req.body.To || "",
+      timestamp: new Date().toISOString(),
+      drives: null,
+      year: "",
+      make: "",
+      model: "",
+      location: "",
+      condition: "",
+    });
+  }
+  return callState.get(callSid);
+}
+
+function pickUserInput(req) {
+  // If speech was used, Twilio provides SpeechResult
+  const speech = (req.body.SpeechResult || "").trim();
+  // If keypad was used, Twilio provides Digits
+  const digits = (req.body.Digits || "").trim();
+
+  return { speech, digits };
+}
+
+function sayAndGather({ twiml, prompt, actionUrl, mode }) {
+  // mode: "dtmf" or "speech" or "both"
+  const input =
+    mode === "dtmf" ? "dtmf" : mode === "speech" ? "speech" : "dtmf speech";
+
+  const gather = twiml.gather({
+    input,
+    action: actionUrl,
+    method: "POST",
+    timeout: 6,
+    speechTimeout: "auto",
+    language: "en-CA",
+    hints: "Vancouver, Surrey, Richmond, Langley, Abbotsford, Coquitlam, Burnaby",
+  });
+
+  gather.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, prompt);
+
+  // If no input, Twilio continues here:
+  twiml.say(
+    { voice: "Polly-Matthew-Neural", language: "en-CA" },
+    "Sorry, I did not get that."
+  );
+  // redirect back to collect to repeat the same step
+  twiml.redirect({ method: "POST" }, actionUrl);
+}
+
+// ----- TWILIO VOICE: START -----
 app.post("/twilio/voice", async (req, res) => {
-  const requestId = `twilio-${Date.now()}`;
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
+  const state = getOrCreateState(callSid, req);
+
+  console.log(`[CALL START] CallSid=${callSid} From=${state.from} To=${state.to}`);
+
+  twiml.say(
+    { voice: "Polly-Matthew-Neural", language: "en-CA" },
+    "Hi, thanks for calling Cash Car B C. I will ask a few quick questions to estimate your offer."
+  );
+
+  // Ask first question
+  sayAndGather({
+    twiml,
+    prompt: "Does the car drive? Press 1 for yes. Press 2 for no.",
+    actionUrl: "/twilio/collect",
+    mode: "dtmf",
+  });
+
+  res.type("text/xml");
+  return res.send(twiml.toString());
+});
+
+// ----- TWILIO VOICE: COLLECT STEPS -----
+app.post("/twilio/collect", async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
+  const state = getOrCreateState(callSid, req);
+
+  const { speech, digits } = pickUserInput(req);
+  console.log(`[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`);
 
   try {
-    const twiml = new twilio.twiml.VoiceResponse();
+    // Step handler
+    if (state.step === "drives") {
+      if (digits === "1") state.drives = true;
+      else if (digits === "2") state.drives = false;
+      else {
+        sayAndGather({
+          twiml,
+          prompt: "Please press 1 if the car drives, or press 2 if it does not.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
 
-    // Twilio request body debug (don’t print everything)
-    const fromNumber = req.body.From || "";
-    const toNumber = req.body.To || "";
-    const callSid = req.body.CallSid || "";
-    const timestamp = new Date().toISOString();
+      state.step = "year";
 
-    console.log(`[${requestId}] Incoming Twilio call`, {
-      From: fromNumber,
-      To: toNumber,
-      CallSid: callSid,
-    });
-
-    // ---- GOOGLE SHEET APPEND (WITH LOGS) ----
-    try {
-      console.log(`[${requestId}] Sheet env check`, {
-        hasServiceAccount: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT),
-        sheetId: process.env.GOOGLE_SHEET_ID ? "✅ set" : "❌ missing",
+      sayAndGather({
+        twiml,
+        prompt: "Enter the car year using 4 digits. For example, 2012.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
       });
 
-      console.log(`[${requestId}] About to authorize Google JWT...`);
-      const auth = getGoogleAuth();
-      await auth.authorize();
-      console.log(`[${requestId}] ✅ Google auth OK`);
-
-      console.log(
-        `[${requestId}] About to append row to sheet...`,
-        process.env.GOOGLE_SHEET_ID
-      );
-
-      await sheets.spreadsheets.values.append({
-        auth,
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: "Sheet1!A:Z",
-        valueInputOption: "RAW",
-        requestBody: {
-          values: [
-            [
-              timestamp, // Timestamp
-              "", // Caller Name (unknown for now)
-              fromNumber, // Phone Number
-              "", // Car Year
-              "", // Car Make
-              "", // Car Model
-              "", // Drives?
-              "Phone call - no quote yet", // AI Price Given (placeholder)
-              "", // Location
-              `Incoming call to ${toNumber} | CallSid=${callSid}`, // Notes
-            ],
-          ],
-        },
-      });
-
-      console.log(`[${requestId}] ✅ Sheet append OK`);
-    } catch (sheetErr) {
-      console.error(`[${requestId}] ❌ Error logging call to Google Sheet:`, sheetErr);
-      // Do NOT fail the call if sheet write fails
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
-    // Voice message to caller
+    if (state.step === "year") {
+      const y = digits;
+      if (!/^\d{4}$/.test(y)) {
+        sayAndGather({
+          twiml,
+          prompt: "Please enter a 4 digit year. For example, 2015.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.year = y;
+      state.step = "make";
+
+      sayAndGather({
+        twiml,
+        prompt: "Now say the car make. For example, Toyota, Honda, or Ford.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+      });
+
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "make") {
+      if (!speech) {
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the make. Please say the car make again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.make = speech;
+      state.step = "model";
+
+      sayAndGather({
+        twiml,
+        prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+      });
+
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "model") {
+      if (!speech) {
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the model. Please say the model again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.model = speech;
+      state.step = "location";
+
+      sayAndGather({
+        twiml,
+        prompt: "Please say your pickup city. For example, Surrey, Vancouver, or Langley.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+      });
+
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "location") {
+      if (!speech) {
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the city. Please say the pickup city again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.location = speech;
+      state.step = "condition";
+
+      sayAndGather({
+        twiml,
+        prompt:
+          "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+      });
+
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "condition") {
+      if (!speech) {
+        sayAndGather({
+          twiml,
+          prompt:
+            "Sorry, I did not catch the condition. Please briefly describe the condition again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.condition = speech;
+      state.step = "done";
+
+      // ---- Calculate price ----
+      const { min, max } = calculatePriceRange({
+        drives: Boolean(state.drives),
+        year: state.year,
+        location: state.location,
+        condition: state.condition,
+      });
+
+      const priceText = `$${min} to $${max}`;
+
+      // ---- Append to Google Sheet ----
+      try {
+        const auth = getGoogleAuth();
+        await auth.authorize();
+
+        await sheets.spreadsheets.values.append({
+          auth,
+          spreadsheetId: process.env.GOOGLE_SHEET_ID,
+          range: "Sheet1!A:Z",
+          valueInputOption: "RAW",
+          requestBody: {
+            values: [
+              [
+                state.timestamp,          // Timestamp
+                "",                       // Caller Name
+                state.from,               // Phone Number (caller)
+                state.year,               // Year
+                state.make,               // Make
+                state.model,              // Model
+                state.drives ? "Yes" : "No", // Drives
+                priceText,                // AI Price Given
+                state.location,           // Location
+                state.condition,          // Condition / Notes
+                `CallSid=${callSid} To=${state.to}`, // Extra notes
+              ],
+            ],
+          },
+        });
+
+        console.log(`[DONE] ✅ Sheet updated. CallSid=${callSid} price=${priceText}`);
+      } catch (sheetErr) {
+        console.error(`[DONE] ❌ Sheet append failed CallSid=${callSid}`, sheetErr);
+      }
+
+      // ---- Speak result to caller ----
+      twiml.say(
+        { voice: "Polly-Matthew-Neural", language: "en-CA" },
+        `Thanks. Based on your ${state.year} ${state.make} ${state.model} in ${state.location}, our rough estimate is ${priceText}.`
+      );
+      twiml.say(
+        { voice: "Polly-Matthew-Neural", language: "en-CA" },
+        "A human will confirm the final offer shortly. Goodbye."
+      );
+      twiml.hangup();
+
+      // Cleanup memory
+      callState.delete(callSid);
+
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    // Fallback if state is weird
     twiml.say(
-      {
-        voice: "Polly-Matthew-Neural",
-        language: "en-CA",
-      },
-      "Hi, thanks for calling Cash Car B C. Our A I assistant is in testing right now. A human will review your call details shortly."
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Sorry, something went wrong. Please call again."
     );
+    twiml.hangup();
+    callState.delete(callSid);
 
     res.type("text/xml");
     return res.send(twiml.toString());
   } catch (err) {
-    console.error(`[${requestId}] ❌ Error in /twilio/voice:`, err);
-    return res.status(500).send("Error");
+    console.error(`[ERROR] CallSid=${callSid}`, err);
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Sorry, we had a system error. Please call again later."
+    );
+    twiml.hangup();
+    callState.delete(callSid);
+
+    res.type("text/xml");
+    return res.send(twiml.toString());
   }
 });
 
-// Simple endpoint to test pricing + Google Sheet from Postman/curl
+// ----- KEEP YOUR API QUOTE ENDPOINT (OPTIONAL) -----
 app.post("/api/quote", async (req, res) => {
-  const requestId = `quote-${Date.now()}`;
-
   const {
     callerName,
     phoneNumber,
@@ -206,12 +452,9 @@ app.post("/api/quote", async (req, res) => {
   const timestamp = new Date().toISOString();
 
   try {
-    console.log(`[${requestId}] About to authorize Google JWT...`);
     const auth = getGoogleAuth();
     await auth.authorize();
-    console.log(`[${requestId}] ✅ Google auth OK`);
 
-    console.log(`[${requestId}] About to append quote row...`);
     await sheets.spreadsheets.values.append({
       auth,
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -235,15 +478,9 @@ app.post("/api/quote", async (req, res) => {
       },
     });
 
-    console.log(`[${requestId}] ✅ Quote sheet append OK`);
-
-    return res.json({
-      success: true,
-      priceRange: { min, max },
-      priceText,
-    });
+    return res.json({ success: true, priceRange: { min, max }, priceText });
   } catch (err) {
-    console.error(`[${requestId}] ❌ Error writing quote to Google Sheet:`, err);
+    console.error("Error writing to Google Sheet:", err);
     return res.status(500).json({ success: false, error: "Sheet write failed" });
   }
 });
