@@ -6,6 +6,9 @@ import { google } from "googleapis";
 // ----- CONFIG -----
 const PORT = process.env.PORT || 3000;
 
+// Optional: set in Render env vars like +17788898748
+const HUMAN_TRANSFER_NUMBER = process.env.HUMAN_TRANSFER_NUMBER || "";
+
 // Google Sheets
 const sheets = google.sheets("v4");
 
@@ -66,6 +69,47 @@ function calculatePriceRange({ drives, year, location, condition }) {
   return { min: Math.round(min), max: Math.round(max) };
 }
 
+// ----- TEXT HELPERS -----
+function cleanText(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function similarityScore(a, b) {
+  const aa = cleanText(a);
+  const bb = cleanText(b);
+  const maxLen = Math.max(aa.length, bb.length);
+  if (maxLen === 0) return 0;
+  const dist = levenshtein(aa, bb);
+  return 1 - dist / maxLen; // 0..1
+}
+
 // ----- LOCATION NORMALIZATION (Step 1.5) -----
 const KNOWN_CITIES = [
   "Vancouver",
@@ -88,68 +132,22 @@ const KNOWN_CITIES = [
 ];
 
 const CITY_ALIASES = {
-  // common weird mishears / variants
   hobbits: "Abbotsford",
   abbot: "Abbotsford",
   abbots: "Abbotsford",
-  abbotsford: "Abbotsford",
-  surrey: "Surrey",
-  surree: "Surrey",
+  abotsford: "Abbotsford",
   vancover: "Vancouver",
-  vancouver: "Vancouver",
-  richmond: "Richmond",
+  surree: "Surrey",
 };
-
-function cleanText(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function levenshtein(a, b) {
-  const m = a.length;
-  const n = b.length;
-  if (m === 0) return n;
-  if (n === 0) return m;
-
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1, // delete
-        dp[i][j - 1] + 1, // insert
-        dp[i - 1][j - 1] + cost // substitute
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-function similarityScore(a, b) {
-  const aa = cleanText(a);
-  const bb = cleanText(b);
-  const maxLen = Math.max(aa.length, bb.length);
-  if (maxLen === 0) return 0;
-  const dist = levenshtein(aa, bb);
-  return 1 - dist / maxLen; // 0..1
-}
 
 function normalizeCity(spoken) {
   const raw = String(spoken || "").trim();
   const cleaned = cleanText(raw);
 
-  // 1) alias exact (covers "hobbits" etc.)
   if (cleaned && CITY_ALIASES[cleaned]) {
     return { raw, normalized: CITY_ALIASES[cleaned], score: 1.0, method: "alias" };
   }
 
-  // 2) fuzzy match against list
   let bestCity = "";
   let bestScore = 0;
 
@@ -161,10 +159,104 @@ function normalizeCity(spoken) {
     }
   }
 
-  // If the match is weak, fall back to raw (but we will still confirm)
   const normalized = bestScore >= 0.62 ? bestCity : raw || bestCity;
-
   return { raw, normalized, score: Number(bestScore.toFixed(3)), method: "fuzzy" };
+}
+
+// ----- MAKE NORMALIZATION (Step 1.6) -----
+const KNOWN_MAKES = [
+  "Toyota",
+  "Honda",
+  "Hyundai",
+  "Kia",
+  "Nissan",
+  "Mazda",
+  "Subaru",
+  "Ford",
+  "Chevrolet",
+  "GMC",
+  "Dodge",
+  "Jeep",
+  "Chrysler",
+  "Volkswagen",
+  "Audi",
+  "BMW",
+  "Mercedes-Benz",
+  "Lexus",
+  "Acura",
+  "Infiniti",
+  "Mitsubishi",
+  "Volvo",
+  "Tesla",
+  "Mini",
+  "Buick",
+  "Cadillac",
+  "Lincoln",
+  "Porsche",
+];
+
+const MAKE_ALIASES = {
+  chev: "Chevrolet",
+  chevy: "Chevrolet",
+  volkswagon: "Volkswagen",
+  merc: "Mercedes-Benz",
+  mercedes: "Mercedes-Benz",
+  b m w: "BMW",
+  beemer: "BMW",
+  hundai: "Hyundai",
+  toyoda: "Toyota",
+};
+
+function normalizeMake(spoken) {
+  const raw = String(spoken || "").trim();
+  const cleaned = cleanText(raw);
+
+  if (cleaned && MAKE_ALIASES[cleaned]) {
+    return { raw, normalized: MAKE_ALIASES[cleaned], score: 1.0, method: "alias" };
+  }
+
+  let bestMake = "";
+  let bestScore = 0;
+
+  for (const make of KNOWN_MAKES) {
+    const s = similarityScore(cleaned, make);
+    if (s > bestScore) {
+      bestScore = s;
+      bestMake = make;
+    }
+  }
+
+  const normalized = bestScore >= 0.62 ? bestMake : raw || bestMake;
+  return { raw, normalized, score: Number(bestScore.toFixed(3)), method: "fuzzy" };
+}
+
+// ----- MODEL CLEANUP (Step 1.6) -----
+const MODEL_ALIASES = {
+  "f one fifty": "F-150",
+  "f one 50": "F-150",
+  "f150": "F-150",
+  "f 150": "F-150",
+  "rav four": "RAV4",
+  "rav4": "RAV4",
+  "cr v": "CR-V",
+  "crv": "CR-V",
+  "c class": "C-Class",
+  "e class": "E-Class",
+};
+
+function normalizeModel(spoken) {
+  const raw = String(spoken || "").trim();
+  const cleaned = cleanText(raw);
+
+  // Alias mapping for a few common ones
+  if (cleaned && MODEL_ALIASES[cleaned]) {
+    return { raw, normalized: MODEL_ALIASES[cleaned], method: "alias" };
+  }
+
+  // Light cleanup: title-ish formatting (keep it simple)
+  // If caller said "civic", "corolla", etc. we store as-is but trimmed.
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  return { raw, normalized, method: "clean" };
 }
 
 // ----- EXPRESS APP -----
@@ -185,15 +277,10 @@ app.get("/", (req, res) => {
 // ----- CALL STATE (IN MEMORY) -----
 const callState = new Map();
 /*
-state = {
-  step: "drives" | "year" | "make" | "model" | "location" | "location_confirm" | "condition" | "done",
-  from, to, timestamp,
-  drives, year, make, model,
-  locationRaw, locationNorm, locationScore,
-  condition
-}
+state.step:
+  drives -> year -> make -> make_confirm -> model -> model_confirm
+  -> mileage -> mileage_confirm -> location -> location_confirm -> condition -> done
 */
-
 function getOrCreateState(callSid, req) {
   if (!callState.has(callSid)) {
     callState.set(callSid, {
@@ -201,14 +288,25 @@ function getOrCreateState(callSid, req) {
       from: req.body.From || "",
       to: req.body.To || "",
       timestamp: new Date().toISOString(),
+
       drives: null,
       year: "",
-      make: "",
-      model: "",
+
+      makeRaw: "",
+      makeNorm: "",
+      makeScore: 0,
+
+      modelRaw: "",
+      modelNorm: "",
+
+      mileageKm: "",
+
       locationRaw: "",
       locationNorm: "",
       locationScore: 0,
+
       condition: "",
+      humanRequested: "No",
     });
   }
   return callState.get(callSid);
@@ -220,7 +318,7 @@ function pickUserInput(req) {
   return { speech, digits };
 }
 
-function sayAndGather({ twiml, prompt, actionUrl, mode }) {
+function sayAndGather({ twiml, prompt, actionUrl, mode, hints }) {
   const input =
     mode === "dtmf" ? "dtmf" : mode === "speech" ? "speech" : "dtmf speech";
 
@@ -231,8 +329,7 @@ function sayAndGather({ twiml, prompt, actionUrl, mode }) {
     timeout: 6,
     speechTimeout: "auto",
     language: "en-CA",
-    // Helps recognition a bit (but not perfect)
-    hints: KNOWN_CITIES.join(", "),
+    hints: hints || "",
   });
 
   gather.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, prompt);
@@ -242,6 +339,24 @@ function sayAndGather({ twiml, prompt, actionUrl, mode }) {
     "Sorry, I did not get that."
   );
   twiml.redirect({ method: "POST" }, actionUrl);
+}
+
+function handleHumanTransfer(twiml, state) {
+  state.humanRequested = "Yes";
+
+  if (HUMAN_TRANSFER_NUMBER) {
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Okay. Please hold while I connect you."
+    );
+    twiml.dial({}, HUMAN_TRANSFER_NUMBER);
+  } else {
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Okay. A human will call you back shortly."
+    );
+    twiml.hangup();
+  }
 }
 
 // ----- TWILIO VOICE: START -----
@@ -277,18 +392,34 @@ app.post("/twilio/collect", async (req, res) => {
   const state = getOrCreateState(callSid, req);
 
   const { speech, digits } = pickUserInput(req);
-  console.log(
-    `[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`
-  );
+  console.log(`[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`);
 
   try {
+    // Universal: allow 0 for human on DTMF steps
+    const dtmfSteps = new Set([
+      "drives",
+      "year",
+      "make_confirm",
+      "model_confirm",
+      "mileage",
+      "mileage_confirm",
+      "location_confirm",
+    ]);
+    if (dtmfSteps.has(state.step) && digits === "0") {
+      console.log(`[HUMAN] Requested transfer. CallSid=${callSid}`);
+      handleHumanTransfer(twiml, state);
+      // Note: if we dial out, Twilio continues; still return TwiML
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
     if (state.step === "drives") {
       if (digits === "1") state.drives = true;
       else if (digits === "2") state.drives = false;
       else {
         sayAndGather({
           twiml,
-          prompt: "Please press 1 if the car drives, or press 2 if it does not.",
+          prompt: "Please press 1 if the car drives, or press 2 if it does not. Press 0 to speak to a human.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -299,7 +430,7 @@ app.post("/twilio/collect", async (req, res) => {
       state.step = "year";
       sayAndGather({
         twiml,
-        prompt: "Enter the car year using 4 digits. For example, 2012.",
+        prompt: "Enter the car year using 4 digits. For example, 2012. Press 0 to speak to a human.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
@@ -312,7 +443,7 @@ app.post("/twilio/collect", async (req, res) => {
       if (!/^\d{4}$/.test(y)) {
         sayAndGather({
           twiml,
-          prompt: "Please enter a 4 digit year. For example, 2015.",
+          prompt: "Please enter a 4 digit year. For example, 2015. Press 0 to speak to a human.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -324,9 +455,10 @@ app.post("/twilio/collect", async (req, res) => {
       state.step = "make";
       sayAndGather({
         twiml,
-        prompt: "Now say the car make. For example, Toyota, Honda, or Ford.",
+        prompt: "Now say the car make. For example, Toyota, Honda, Ford, or BMW.",
         actionUrl: "/twilio/collect",
         mode: "speech",
+        hints: KNOWN_MAKES.join(", "),
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -339,18 +471,64 @@ app.post("/twilio/collect", async (req, res) => {
           prompt: "Sorry, I did not catch the make. Please say the car make again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          hints: KNOWN_MAKES.join(", "),
         });
         res.type("text/xml");
         return res.send(twiml.toString());
       }
 
-      state.make = speech;
-      state.step = "model";
+      const nm = normalizeMake(speech);
+      state.makeRaw = nm.raw;
+      state.makeNorm = nm.normalized;
+      state.makeScore = nm.score;
+
+      console.log(`[MAKE] raw="${state.makeRaw}" normalized="${state.makeNorm}" score=${state.makeScore}`);
+
+      state.step = "make_confirm";
       sayAndGather({
         twiml,
-        prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
+        prompt: `I heard ${state.makeNorm}. Press 1 to confirm. Press 2 to say it again. Or press 0 to speak to a human.`,
         actionUrl: "/twilio/collect",
-        mode: "speech",
+        mode: "dtmf",
+      });
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "make_confirm") {
+      if (digits === "1") {
+        state.step = "model";
+        sayAndGather({
+          twiml,
+          prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      if (digits === "2") {
+        state.makeRaw = "";
+        state.makeNorm = "";
+        state.makeScore = 0;
+        state.step = "make";
+        sayAndGather({
+          twiml,
+          prompt: "Okay. Please say the car make again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+          hints: KNOWN_MAKES.join(", "),
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      sayAndGather({
+        twiml,
+        prompt: "Please press 1 to confirm the make, or press 2 to say it again. Press 0 to speak to a human.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -360,7 +538,7 @@ app.post("/twilio/collect", async (req, res) => {
       if (!speech) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I did not catch the model. Please say the model again.",
+          prompt: "Sorry, I did not catch the model. Please say the car model again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
         });
@@ -368,20 +546,141 @@ app.post("/twilio/collect", async (req, res) => {
         return res.send(twiml.toString());
       }
 
-      state.model = speech;
-      state.step = "location";
+      const nm = normalizeModel(speech);
+      state.modelRaw = nm.raw;
+      state.modelNorm = nm.normalized;
+
+      console.log(`[MODEL] raw="${state.modelRaw}" normalized="${state.modelNorm}"`);
+
+      state.step = "model_confirm";
       sayAndGather({
         twiml,
-        prompt:
-          "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
+        prompt: `I heard ${state.modelNorm}. Press 1 to confirm. Press 2 to say it again. Or press 0 to speak to a human.`,
         actionUrl: "/twilio/collect",
-        mode: "speech",
+        mode: "dtmf",
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // ✅ Step 1.5: Normalize + Confirm location
+    if (state.step === "model_confirm") {
+      if (digits === "1") {
+        state.step = "mileage";
+        sayAndGather({
+          twiml,
+          prompt:
+            "Enter the mileage in kilometers, numbers only. For example, enter 150000. Press 0 to speak to a human.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      if (digits === "2") {
+        state.modelRaw = "";
+        state.modelNorm = "";
+        state.step = "model";
+        sayAndGather({
+          twiml,
+          prompt: "Okay. Please say the car model again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      sayAndGather({
+        twiml,
+        prompt: "Please press 1 to confirm the model, or press 2 to say it again. Press 0 to speak to a human.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
+      });
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "mileage") {
+      const km = digits;
+      // Basic validation: digits only, reasonable range
+      if (!/^\d{1,6}$/.test(km)) {
+        sayAndGather({
+          twiml,
+          prompt:
+            "Please enter mileage in kilometers using numbers only. Example: 150000. Press 0 to speak to a human.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      const kmNum = parseInt(km, 10);
+      if (isNaN(kmNum) || kmNum < 0 || kmNum > 800000) {
+        sayAndGather({
+          twiml,
+          prompt:
+            "That mileage seems unusual. Please enter mileage in kilometers again. Example: 150000. Press 0 to speak to a human.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      state.mileageKm = String(kmNum);
+      state.step = "mileage_confirm";
+
+      sayAndGather({
+        twiml,
+        prompt: `You entered ${state.mileageKm} kilometers. Press 1 to confirm. Press 2 to re-enter. Or press 0 to speak to a human.`,
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
+      });
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    if (state.step === "mileage_confirm") {
+      if (digits === "1") {
+        state.step = "location";
+        sayAndGather({
+          twiml,
+          prompt: "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+          hints: KNOWN_CITIES.join(", "),
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      if (digits === "2") {
+        state.mileageKm = "";
+        state.step = "mileage";
+        sayAndGather({
+          twiml,
+          prompt:
+            "Okay. Enter the mileage in kilometers, numbers only. Example: 150000. Press 0 to speak to a human.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      sayAndGather({
+        twiml,
+        prompt: "Please press 1 to confirm mileage, or press 2 to re-enter. Press 0 to speak to a human.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
+      });
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+    // Location + confirmation (Step 1.5)
     if (state.step === "location") {
       if (!speech) {
         sayAndGather({
@@ -389,6 +688,7 @@ app.post("/twilio/collect", async (req, res) => {
           prompt: "Sorry, I did not catch the city. Please say the pickup city again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          hints: KNOWN_CITIES.join(", "),
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -399,26 +699,21 @@ app.post("/twilio/collect", async (req, res) => {
       state.locationNorm = norm.normalized;
       state.locationScore = norm.score;
 
-      console.log(
-        `[LOCATION] raw="${state.locationRaw}" normalized="${state.locationNorm}" score=${state.locationScore}`
-      );
+      console.log(`[LOCATION] raw="${state.locationRaw}" normalized="${state.locationNorm}" score=${state.locationScore}`);
 
-      // Ask caller to confirm
       state.step = "location_confirm";
       sayAndGather({
         twiml,
-        prompt: `I heard ${state.locationNorm}. Press 1 to confirm. Press 2 to say it again.`,
+        prompt: `I heard ${state.locationNorm}. Press 1 to confirm. Press 2 to say it again. Or press 0 to speak to a human.`,
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
     if (state.step === "location_confirm") {
       if (digits === "1") {
-        // confirmed
         state.step = "condition";
         sayAndGather({
           twiml,
@@ -432,27 +727,25 @@ app.post("/twilio/collect", async (req, res) => {
       }
 
       if (digits === "2") {
-        // redo location
         state.locationRaw = "";
         state.locationNorm = "";
         state.locationScore = 0;
         state.step = "location";
-
         sayAndGather({
           twiml,
           prompt:
             "Okay. Please say the pickup city again. For example, Surrey, Vancouver, Abbotsford, or Langley.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          hints: KNOWN_CITIES.join(", "),
         });
         res.type("text/xml");
         return res.send(twiml.toString());
       }
 
-      // invalid input
       sayAndGather({
         twiml,
-        prompt: "Please press 1 to confirm the city, or press 2 to say it again.",
+        prompt: "Please press 1 to confirm the city, or press 2 to say it again. Press 0 to speak to a human.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
@@ -464,8 +757,7 @@ app.post("/twilio/collect", async (req, res) => {
       if (!speech) {
         sayAndGather({
           twiml,
-          prompt:
-            "Sorry, I did not catch the condition. Please briefly describe the condition again.",
+          prompt: "Sorry, I did not catch the condition. Please describe it again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
         });
@@ -476,9 +768,7 @@ app.post("/twilio/collect", async (req, res) => {
       state.condition = speech;
       state.step = "done";
 
-      // Use normalized location for pricing
       const locationForPricing = state.locationNorm || state.locationRaw;
-
       const { min, max } = calculatePriceRange({
         drives: Boolean(state.drives),
         year: state.year,
@@ -501,19 +791,24 @@ app.post("/twilio/collect", async (req, res) => {
           requestBody: {
             values: [
               [
-                state.timestamp,                    // Timestamp
-                "",                                 // Caller Name
-                state.from,                         // Phone Number
-                state.year,                         // Year
-                state.make,                         // Make
-                state.model,                        // Model
-                state.drives ? "Yes" : "No",         // Drives
-                priceText,                          // AI Price
-                state.locationNorm || "",            // Location (Normalized)
-                state.condition,                    // Condition
-                state.locationRaw || "",             // Location (Raw Speech)
-                `CityScore=${state.locationScore}`,  // Debug score
-                `CallSid=${callSid} To=${state.to}`, // Notes
+                state.timestamp,                       // Timestamp
+                "",                                    // Caller Name
+                state.from,                            // Phone Number
+                state.year,                            // Year
+                state.makeNorm || "",                  // Make (Normalized)
+                state.modelNorm || "",                 // Model (Normalized/Clean)
+                state.drives ? "Yes" : "No",            // Drives
+                state.mileageKm || "",                 // Mileage (km)
+                priceText,                             // Price estimate
+                state.locationNorm || "",               // Location (Normalized)
+                state.condition || "",                 // Condition
+                state.makeRaw || "",                    // Make (Raw)
+                `MakeScore=${state.makeScore}`,         // Make score
+                state.modelRaw || "",                   // Model (Raw)
+                state.locationRaw || "",                // Location (Raw)
+                `CityScore=${state.locationScore}`,     // City score
+                `HumanRequested=${state.humanRequested}`, // Human flag
+                `CallSid=${callSid} To=${state.to}`,    // Notes
               ],
             ],
           },
@@ -527,7 +822,7 @@ app.post("/twilio/collect", async (req, res) => {
       // Speak result
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
-        `Thanks. Based on your ${state.year} ${state.make} ${state.model} in ${locationForPricing}, our rough estimate is ${priceText}.`
+        `Thanks. Based on your ${state.year} ${state.makeNorm} ${state.modelNorm} in ${locationForPricing}, our rough estimate is ${priceText}.`
       );
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -540,7 +835,7 @@ app.post("/twilio/collect", async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    // fallback
+    // Fallback
     twiml.say(
       { voice: "Polly-Matthew-Neural", language: "en-CA" },
       "Sorry, something went wrong. Please call again."
@@ -561,63 +856,6 @@ app.post("/twilio/collect", async (req, res) => {
 
     res.type("text/xml");
     return res.send(twiml.toString());
-  }
-});
-
-// Optional: keep your Postman endpoint
-app.post("/api/quote", async (req, res) => {
-  const {
-    callerName,
-    phoneNumber,
-    year,
-    make,
-    model,
-    drives,
-    location,
-    condition,
-  } = req.body || {};
-
-  const { min, max } = calculatePriceRange({
-    drives: String(drives).toLowerCase() === "true" || drives === true,
-    year,
-    location,
-    condition,
-  });
-
-  const priceText = `$${min} - $${max}`;
-  const timestamp = new Date().toISOString();
-
-  try {
-    const auth = getGoogleAuth();
-    await auth.authorize();
-
-    await sheets.spreadsheets.values.append({
-      auth,
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "Sheet1!A:Z",
-      valueInputOption: "RAW",
-      requestBody: {
-        values: [
-          [
-            timestamp,
-            callerName || "",
-            phoneNumber || "",
-            year || "",
-            make || "",
-            model || "",
-            drives ? "Yes" : "No",
-            priceText,
-            location || "",
-            condition || "",
-          ],
-        ],
-      },
-    });
-
-    return res.json({ success: true, priceRange: { min, max }, priceText });
-  } catch (err) {
-    console.error("Error writing to Google Sheet:", err);
-    return res.status(500).json({ success: false, error: "Sheet write failed" });
   }
 });
 
