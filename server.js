@@ -87,18 +87,57 @@ app.get("/", (req, res) => {
 });
 
 // Endpoint to be called by Twilio voice webhook later
+// Endpoint to be called by Twilio voice webhook
 app.post("/twilio/voice", async (req, res) => {
   try {
     const twiml = new twilio.twiml.VoiceResponse();
 
-    // For now, just say a simple message so we can hook Twilio to it later.
-    // We will upgrade this to full conversational logic in the next step.
+    // Debug log so we can see calls in Render logs
+    console.log("Incoming Twilio call:", req.body.From, "->", req.body.To);
+
+    const fromNumber = req.body.From || "";
+    const toNumber = req.body.To || "";
+    const timestamp = new Date().toISOString();
+
+    // Try to log the call into Google Sheets
+    try {
+      const auth = getGoogleAuth();
+      await auth.authorize();
+
+      await sheets.spreadsheets.values.append({
+        auth,
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: "Sheet1!A:Z", // your tab name is Sheet1
+        valueInputOption: "RAW",
+        requestBody: {
+          values: [
+            [
+              timestamp,                 // Timestamp
+              "",                        // Caller Name (unknown for now)
+              fromNumber,                // Phone Number
+              "",                        // Car Year
+              "",                        // Car Make
+              "",                        // Car Model
+              "",                        // Drives?
+              "Phone call - no quote yet", // AI Price Given (placeholder)
+              "",                        // Location
+              `Incoming call to ${toNumber}` // Notes
+            ],
+          ],
+        },
+      });
+    } catch (sheetErr) {
+      console.error("Error logging call to Google Sheet:", sheetErr);
+      // We don’t fail the call if sheet write fails
+    }
+
+    // Voice message to caller
     twiml.say(
       {
-        voice: "Polly-Matthew-Neural", // a nicer male voice than default
+        voice: "Polly-Matthew-Neural",
         language: "en-CA",
       },
-      "Hi, this is the Cash Car B C A I assistant. The full conversational version is under construction."
+      "Hi, thanks for calling Cash Car B C. Our A I assistant is in testing right now. A human will review your call details shortly."
     );
 
     res.type("text/xml");
