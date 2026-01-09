@@ -6,10 +6,10 @@ import { google } from "googleapis";
 // ----- CONFIG -----
 const PORT = process.env.PORT || 3000;
 
-// Twilio (for later – when we hook up voice)
+// Twilio (optional here, but kept for later use)
 const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
+  process.env.TWILIO_ACCOUNT_SID || "",
+  process.env.TWILIO_AUTH_TOKEN || ""
 );
 
 // Google Sheets
@@ -21,6 +21,12 @@ function getGoogleAuth() {
   }
 
   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+
+  // 🔥 Very common fix when JSON is stored in environment variables
+  // (private_key comes with escaped newlines \\n)
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+  }
 
   return new google.auth.JWT(
     serviceAccount.client_email,
@@ -81,54 +87,80 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// ✅ Optional: log every request path (helps confirm Twilio is hitting your app)
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
 // Simple health check
 app.get("/", (req, res) => {
   res.status(200).send("CashCarBC AI backend is running.\n");
 });
 
-// Endpoint to be called by Twilio voice webhook later
 // Endpoint to be called by Twilio voice webhook
 app.post("/twilio/voice", async (req, res) => {
+  const requestId = `twilio-${Date.now()}`;
+
   try {
     const twiml = new twilio.twiml.VoiceResponse();
 
-    // Debug log so we can see calls in Render logs
-    console.log("Incoming Twilio call:", req.body.From, "->", req.body.To);
-
+    // Twilio request body debug (don’t print everything)
     const fromNumber = req.body.From || "";
     const toNumber = req.body.To || "";
+    const callSid = req.body.CallSid || "";
     const timestamp = new Date().toISOString();
 
-    // Try to log the call into Google Sheets
+    console.log(`[${requestId}] Incoming Twilio call`, {
+      From: fromNumber,
+      To: toNumber,
+      CallSid: callSid,
+    });
+
+    // ---- GOOGLE SHEET APPEND (WITH LOGS) ----
     try {
+      console.log(`[${requestId}] Sheet env check`, {
+        hasServiceAccount: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT),
+        sheetId: process.env.GOOGLE_SHEET_ID ? "✅ set" : "❌ missing",
+      });
+
+      console.log(`[${requestId}] About to authorize Google JWT...`);
       const auth = getGoogleAuth();
       await auth.authorize();
+      console.log(`[${requestId}] ✅ Google auth OK`);
+
+      console.log(
+        `[${requestId}] About to append row to sheet...`,
+        process.env.GOOGLE_SHEET_ID
+      );
 
       await sheets.spreadsheets.values.append({
         auth,
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: "Sheet1!A:Z", // your tab name is Sheet1
+        range: "Sheet1!A:Z",
         valueInputOption: "RAW",
         requestBody: {
           values: [
             [
-              timestamp,                 // Timestamp
-              "",                        // Caller Name (unknown for now)
-              fromNumber,                // Phone Number
-              "",                        // Car Year
-              "",                        // Car Make
-              "",                        // Car Model
-              "",                        // Drives?
+              timestamp, // Timestamp
+              "", // Caller Name (unknown for now)
+              fromNumber, // Phone Number
+              "", // Car Year
+              "", // Car Make
+              "", // Car Model
+              "", // Drives?
               "Phone call - no quote yet", // AI Price Given (placeholder)
-              "",                        // Location
-              `Incoming call to ${toNumber}` // Notes
+              "", // Location
+              `Incoming call to ${toNumber} | CallSid=${callSid}`, // Notes
             ],
           ],
         },
       });
+
+      console.log(`[${requestId}] ✅ Sheet append OK`);
     } catch (sheetErr) {
-      console.error("Error logging call to Google Sheet:", sheetErr);
-      // We don’t fail the call if sheet write fails
+      console.error(`[${requestId}] ❌ Error logging call to Google Sheet:`, sheetErr);
+      // Do NOT fail the call if sheet write fails
     }
 
     // Voice message to caller
@@ -143,13 +175,15 @@ app.post("/twilio/voice", async (req, res) => {
     res.type("text/xml");
     return res.send(twiml.toString());
   } catch (err) {
-    console.error("Error in /twilio/voice:", err);
+    console.error(`[${requestId}] ❌ Error in /twilio/voice:`, err);
     return res.status(500).send("Error");
   }
 });
 
 // Simple endpoint to test pricing + Google Sheet from Postman/curl
 app.post("/api/quote", async (req, res) => {
+  const requestId = `quote-${Date.now()}`;
+
   const {
     callerName,
     phoneNumber,
@@ -172,9 +206,12 @@ app.post("/api/quote", async (req, res) => {
   const timestamp = new Date().toISOString();
 
   try {
+    console.log(`[${requestId}] About to authorize Google JWT...`);
     const auth = getGoogleAuth();
     await auth.authorize();
+    console.log(`[${requestId}] ✅ Google auth OK`);
 
+    console.log(`[${requestId}] About to append quote row...`);
     await sheets.spreadsheets.values.append({
       auth,
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -198,13 +235,15 @@ app.post("/api/quote", async (req, res) => {
       },
     });
 
+    console.log(`[${requestId}] ✅ Quote sheet append OK`);
+
     return res.json({
       success: true,
       priceRange: { min, max },
       priceText,
     });
   } catch (err) {
-    console.error("Error writing to Google Sheet:", err);
+    console.error(`[${requestId}] ❌ Error writing quote to Google Sheet:`, err);
     return res.status(500).json({ success: false, error: "Sheet write failed" });
   }
 });
