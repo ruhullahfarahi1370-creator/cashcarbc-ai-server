@@ -140,7 +140,7 @@ app.post("/api/quote", async (req, res) => {
       auth,
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: "Sheet1!A:Z",
-      valueInputOption: "USER_ENTERED",
+      valueInputOption: "RAW",
       requestBody: {
         values: [
           [
