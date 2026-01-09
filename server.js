@@ -201,7 +201,7 @@ const MAKE_ALIASES = {
   volkswagon: "Volkswagen",
   merc: "Mercedes-Benz",
   mercedes: "Mercedes-Benz",
-  b m w: "BMW",
+  "b m w": "BMW",
   beemer: "BMW",
   hundai: "Hyundai",
   toyoda: "Toyota",
