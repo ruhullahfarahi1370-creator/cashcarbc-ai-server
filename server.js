@@ -454,10 +454,7 @@ app.post("/twilio/collect", async (req, res) => {
       }
 
       // Option C decision: only ask postal if needed
-      const needsPostal =
-        !state.drives ||                      // towing matters more when non-drivable
-        !NEAR_CITIES.has(state.cityNorm) ||   // city not in near list
-        state.cityScore < 0.75;              // low confidence
+      const needsPostal = true;
 
       if (needsPostal) {
         state.step = "postal";
