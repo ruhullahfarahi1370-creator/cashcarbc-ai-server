@@ -14,13 +14,18 @@ const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 // Google Sheets
 const sheets = google.sheets("v4");
 
+// ----- Google Auth -----
 function getGoogleAuth() {
   if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
     throw new Error("GOOGLE_SERVICE_ACCOUNT env var is missing");
   }
+  if (!process.env.GOOGLE_SHEET_ID) {
+    throw new Error("GOOGLE_SHEET_ID env var is missing");
+  }
+
   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 
-  // Fix escaped newlines in env vars
+  // Fix escaped newlines in env vars (common on Render)
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
   }
@@ -33,7 +38,27 @@ function getGoogleAuth() {
   );
 }
 
-// ----- PRICING LOGIC (you can evolve this later with distance rules) -----
+// ----- Deterministic sheet write (always next row based on Column A) -----
+async function appendRowDeterministic(auth, rowValues) {
+  const colA = await sheets.spreadsheets.values.get({
+    auth,
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "Sheet1!A:A",
+  });
+
+  const values = colA.data.values || [];
+  const nextRow = values.length + 1; // A1 is header
+
+  await sheets.spreadsheets.values.update({
+    auth,
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Sheet1!A${nextRow}`,
+    valueInputOption: "RAW",
+    requestBody: { values: [rowValues] },
+  });
+}
+
+// ----- PRICING LOGIC (basic placeholder tiers) -----
 function calculatePriceRange({ drives, year, location, distanceKm }) {
   let min = drives ? 300 : 120;
   let max = drives ? 700 : 350;
@@ -41,24 +66,35 @@ function calculatePriceRange({ drives, year, location, distanceKm }) {
   const y = parseInt(year, 10);
   if (!isNaN(y)) {
     if (y >= 2015) {
-      min += 100; max += 100;
+      min += 100;
+      max += 100;
     } else if (y >= 2008 && y <= 2014) {
-      min += 50; max += 50;
+      min += 50;
+      max += 50;
     }
   }
 
-  // Distance impact (simple placeholder tiers — tweak anytime)
+  // Distance impact (simple tiers)
   if (typeof distanceKm === "number" && !isNaN(distanceKm)) {
-    if (distanceKm <= 15) { min += 25; max += 25; }
-    else if (distanceKm <= 40) { /* no change */ }
-    else if (distanceKm <= 80) { min -= 50; max -= 50; }
-    else { min -= 100; max -= 150; }
+    if (distanceKm <= 15) {
+      min += 25;
+      max += 25;
+    } else if (distanceKm <= 40) {
+      // no change
+    } else if (distanceKm <= 80) {
+      min -= 50;
+      max -= 50;
+    } else {
+      min -= 100;
+      max -= 150;
+    }
   }
 
-  // Location rough adjustment (kept minimal now that distance exists)
+  // Light location adjustment
   const loc = (location || "").toLowerCase();
   if (/vancouver|richmond|north vancouver|coquitlam|burnaby|new westminster|delta/.test(loc)) {
-    min -= 10; max -= 10;
+    min -= 10;
+    max -= 10;
   }
 
   min = Math.max(min, 50);
@@ -77,7 +113,8 @@ function cleanText(s) {
 }
 
 function levenshtein(a, b) {
-  const m = a.length, n = b.length;
+  const m = a.length,
+    n = b.length;
   if (m === 0) return n;
   if (n === 0) return m;
   const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
@@ -86,11 +123,7 @@ function levenshtein(a, b) {
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
     }
   }
   return dp[m][n];
@@ -101,18 +134,33 @@ function similarityScore(a, b) {
   const bb = cleanText(b);
   const maxLen = Math.max(aa.length, bb.length);
   if (maxLen === 0) return 0;
-  return 1 - (levenshtein(aa, bb) / maxLen);
+  return 1 - levenshtein(aa, bb) / maxLen;
 }
 
 // ----- City normalization -----
 const KNOWN_CITIES = [
-  "Vancouver","Burnaby","Richmond","Surrey","Langley","Coquitlam","Port Coquitlam",
-  "Port Moody","Maple Ridge","Pitt Meadows","Abbotsford","Chilliwack","Mission",
-  "Delta","North Vancouver","West Vancouver","New Westminster"
+  "Vancouver",
+  "Burnaby",
+  "Richmond",
+  "Surrey",
+  "Langley",
+  "Coquitlam",
+  "Port Coquitlam",
+  "Port Moody",
+  "Maple Ridge",
+  "Pitt Meadows",
+  "Abbotsford",
+  "Chilliwack",
+  "Mission",
+  "Delta",
+  "North Vancouver",
+  "West Vancouver",
+  "New Westminster",
 ];
 
 const CITY_ALIASES = {
   hobbits: "Abbotsford",
+  hobits: "Abbotsford",
   abotsford: "Abbotsford",
   vancover: "Vancouver",
   surree: "Surrey",
@@ -126,38 +174,33 @@ function normalizeCity(spoken) {
     return { raw, normalized: CITY_ALIASES[cleaned], score: 1.0, method: "alias" };
   }
 
-  let best = "", bestScore = 0;
+  let best = "";
+  let bestScore = 0;
+
   for (const city of KNOWN_CITIES) {
     const s = similarityScore(cleaned, city);
-    if (s > bestScore) { bestScore = s; best = city; }
+    if (s > bestScore) {
+      bestScore = s;
+      best = city;
+    }
   }
 
   const normalized = bestScore >= 0.62 ? best : raw || best;
   return { raw, normalized, score: Number(bestScore.toFixed(3)), method: "fuzzy" };
 }
 
-// If city is in this list AND car drives, we can skip postal code (Option C)
-const NEAR_CITIES = new Set([
-  "Surrey","Richmond","Vancouver","Burnaby","Delta","New Westminster",
-  "North Vancouver","West Vancouver","Coquitlam","Port Coquitlam","Port Moody"
-]);
-
-// ----- Postal code extraction/normalization (speech) -----
+// ----- Postal code extraction (speech) -----
 function extractPostalCodeFromSpeech(speech) {
-  // Accept patterns like "V6V 1M7" or "V6V1M7"
   const raw = String(speech || "").toUpperCase();
   const cleaned = raw.replace(/[^A-Z0-9]/g, "");
-
-  // Canadian postal: A1A1A1
-  const match = cleaned.match(/([A-Z]\d[A-Z]\d[A-Z]\d)/);
+  const match = cleaned.match(/([A-Z]\d[A-Z]\d[A-Z]\d)/); // A1A1A1
   if (!match) return { ok: false, raw, postal: "" };
 
   const p = match[1];
-  const formatted = `${p.slice(0, 3)} ${p.slice(3)}`; // "V6V 1M7"
-  return { ok: true, raw, postal: formatted };
+  return { ok: true, raw, postal: `${p.slice(0, 3)} ${p.slice(3)}` };
 }
 
-// ----- Google Distance Matrix (driving distance) -----
+// ----- Google Distance Matrix -----
 async function getDrivingDistanceKm(originPostal, destPostal) {
   if (!GOOGLE_MAPS_API_KEY) return { ok: false, km: null, error: "Missing GOOGLE_MAPS_API_KEY" };
 
@@ -166,7 +209,9 @@ async function getDrivingDistanceKm(originPostal, destPostal) {
 
   const url =
     `https://maps.googleapis.com/maps/api/distancematrix/json` +
-    `?origins=${origin}&destinations=${dest}&mode=driving&units=metric&key=${encodeURIComponent(GOOGLE_MAPS_API_KEY)}`;
+    `?origins=${origin}&destinations=${dest}&mode=driving&units=metric&key=${encodeURIComponent(
+      GOOGLE_MAPS_API_KEY
+    )}`;
 
   const resp = await fetch(url);
   const data = await resp.json();
@@ -179,7 +224,7 @@ async function getDrivingDistanceKm(originPostal, destPostal) {
   const meters = element.distance?.value;
   if (typeof meters !== "number") return { ok: false, km: null, error: "No distance value" };
 
-  return { ok: true, km: Math.round((meters / 1000) * 10) / 10, error: "" }; // 1 decimal
+  return { ok: true, km: Math.round((meters / 1000) * 10) / 10, error: "" };
 }
 
 // ----- Twilio helpers -----
@@ -192,6 +237,7 @@ function pickUserInput(req) {
 
 function sayAndGather({ twiml, prompt, actionUrl, mode, hints }) {
   const input = mode === "dtmf" ? "dtmf" : mode === "speech" ? "speech" : "dtmf speech";
+
   const gather = twiml.gather({
     input,
     action: actionUrl,
@@ -204,6 +250,7 @@ function sayAndGather({ twiml, prompt, actionUrl, mode, hints }) {
 
   gather.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, prompt);
 
+  // If gather returns nothing, Twilio continues — redirect to same step
   twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, "Sorry, I did not get that.");
   twiml.redirect({ method: "POST" }, actionUrl);
 }
@@ -222,13 +269,6 @@ app.get("/", (req, res) => res.status(200).send("CashCarBC backend is running.\n
 
 // ----- Call state -----
 const callState = new Map();
-/*
-Sheet columns you have:
-Timestamp | Caller Name | Phone Number | Car Year | Car Make | Car Model | Drives? | Mileage | AI price Given | Location | Notes
-
-We will append extra columns to the right:
-AskingPrice | DistanceKm | PickupPostal | CityRaw | CityScore | RuleApplied
-*/
 
 function getOrCreateState(callSid, req) {
   if (!callState.has(callSid)) {
@@ -251,7 +291,6 @@ function getOrCreateState(callSid, req) {
       cityScore: 0,
 
       pickupPostal: "",
-
       distanceKm: null,
       ruleApplied: "N/A",
     });
@@ -263,10 +302,13 @@ function getOrCreateState(callSid, req) {
 app.post("/twilio/voice", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
-  const state = getOrCreateState(callSid, req);
 
-  twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" },
-    "Hi, thanks for calling Cash Car B C. I will ask a few quick questions to estimate your offer.");
+  getOrCreateState(callSid, req);
+
+  twiml.say(
+    { voice: "Polly-Matthew-Neural", language: "en-CA" },
+    "Hi, thanks for calling Cash Car B C. I will ask a few quick questions to estimate your offer."
+  );
 
   sayAndGather({
     twiml,
@@ -286,7 +328,9 @@ app.post("/twilio/collect", async (req, res) => {
   const state = getOrCreateState(callSid, req);
   const { speech, digits } = pickUserInput(req);
 
-  console.log(`[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`);
+  console.log(
+    `[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`
+  );
 
   try {
     // 1) drives
@@ -294,8 +338,14 @@ app.post("/twilio/collect", async (req, res) => {
       if (digits === "1") state.drives = true;
       else if (digits === "2") state.drives = false;
       else {
-        sayAndGather({ twiml, prompt: "Press 1 if it drives, press 2 if it does not.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Press 1 if it drives, press 2 if it does not.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       state.step = "year";
@@ -305,7 +355,8 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     // 2) year with validation
@@ -314,8 +365,14 @@ app.post("/twilio/collect", async (req, res) => {
       const currentYear = new Date().getFullYear();
 
       if (!/^\d{4}$/.test(y)) {
-        sayAndGather({ twiml, prompt: "Please enter a 4 digit year. For example, 2015.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Please enter a 4 digit year. For example, 2015.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       const yNum = parseInt(y, 10);
@@ -326,7 +383,8 @@ app.post("/twilio/collect", async (req, res) => {
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
-        res.type("text/xml"); return res.send(twiml.toString());
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       state.year = y;
@@ -337,14 +395,21 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     // 3) make
     if (state.step === "make") {
       if (!speech) {
-        sayAndGather({ twiml, prompt: "Sorry, I did not catch the make. Please say it again.", actionUrl: "/twilio/collect", mode: "speech" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the make. Please say it again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
       state.make = speech;
       state.step = "model";
@@ -354,16 +419,24 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     // 4) model
     if (state.step === "model") {
       if (!speech) {
-        sayAndGather({ twiml, prompt: "Sorry, I did not catch the model. Please say it again.", actionUrl: "/twilio/collect", mode: "speech" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the model. Please say it again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
       state.model = speech;
+
       state.step = "mileage";
       sayAndGather({
         twiml,
@@ -371,59 +444,93 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
-    // 5) mileage (digits only, basic range)
+    // 5) mileage
     if (state.step === "mileage") {
       const km = digits;
+
       if (!/^\d{1,6}$/.test(km)) {
-        sayAndGather({ twiml, prompt: "Please enter mileage using numbers only. Example: 150000.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Please enter mileage using numbers only. Example: 150000.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
+
       const kmNum = parseInt(km, 10);
       if (isNaN(kmNum) || kmNum < 0 || kmNum > 800000) {
-        sayAndGather({ twiml, prompt: "That mileage seems unusual. Please enter it again. Example: 150000.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "That mileage seems unusual. Please enter it again. Example: 150000.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       state.mileageKm = String(kmNum);
-      state.step = "asking_price";
 
+      state.step = "asking_price";
       sayAndGather({
         twiml,
-        prompt: "How much are you trying to sell the car for? Enter the amount in dollars, numbers only. For example, enter 1200.",
+        prompt:
+          "How much are you trying to sell the car for? Enter the amount in dollars, numbers only. For example, enter 1200.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     // 6) asking price
     if (state.step === "asking_price") {
       const ap = digits;
+
       if (!/^\d{2,7}$/.test(ap)) {
-        sayAndGather({ twiml, prompt: "Please enter the amount in dollars using numbers only. Example: 1200.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Please enter the amount in dollars using numbers only. Example: 1200.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
+
       state.askingPrice = ap;
 
       state.step = "city";
       sayAndGather({
         twiml,
-        prompt: "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
+        prompt:
+          "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
         actionUrl: "/twilio/collect",
         mode: "speech",
         hints: KNOWN_CITIES.join(", "),
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
-    // 7) city (normalize + confirm)
+    // 7) city normalize + confirm
     if (state.step === "city") {
       if (!speech) {
-        sayAndGather({ twiml, prompt: "Sorry, I did not catch the city. Please say it again.", actionUrl: "/twilio/collect", mode: "speech", hints: KNOWN_CITIES.join(", ") });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the city. Please say it again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+          hints: KNOWN_CITIES.join(", "),
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       const norm = normalizeCity(speech);
@@ -438,59 +545,65 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     if (state.step === "city_confirm") {
       if (digits === "2") {
-        state.cityRaw = ""; state.cityNorm = ""; state.cityScore = 0;
+        state.cityRaw = "";
+        state.cityNorm = "";
+        state.cityScore = 0;
         state.step = "city";
-        sayAndGather({ twiml, prompt: "Okay. Please say your pickup city again.", actionUrl: "/twilio/collect", mode: "speech", hints: KNOWN_CITIES.join(", ") });
-        res.type("text/xml"); return res.send(twiml.toString());
-      }
-      if (digits !== "1") {
-        sayAndGather({ twiml, prompt: "Press 1 to confirm the city, or press 2 to say it again.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
-      }
-
-      // Option C decision: only ask postal if needed
-      const needsPostal = true;
-
-      if (needsPostal) {
-        state.step = "postal";
         sayAndGather({
           twiml,
-          prompt: "To estimate distance, please say your postal code. For example, V six V one M seven.",
+          prompt: "Okay. Please say your pickup city again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          hints: KNOWN_CITIES.join(", "),
         });
-        res.type("text/xml"); return res.send(twiml.toString());
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
-      // Skip postal; proceed to condition
-      state.distanceKm = null;
-      state.ruleApplied = "NoPostalNeeded";
-      state.step = "condition";
+      if (digits !== "1") {
+        sayAndGather({
+          twiml,
+          prompt: "Press 1 to confirm the city, or press 2 to say it again.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      // You requested: ALWAYS ask postal code
+      state.step = "postal";
       sayAndGather({
         twiml,
-        prompt: "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
+        prompt:
+          "To estimate distance, please say your postal code. For example, V six V one M seven.",
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
-    // 8) postal code by speech + confirm + compute distance
+    // 8) postal code speech + confirm
     if (state.step === "postal") {
       const parsed = extractPostalCodeFromSpeech(speech);
+
       if (!parsed.ok) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
+          prompt:
+            "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
           actionUrl: "/twilio/collect",
           mode: "speech",
         });
-        res.type("text/xml"); return res.send(twiml.toString());
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       state.pickupPostal = parsed.postal;
@@ -501,7 +614,8 @@ app.post("/twilio/collect", async (req, res) => {
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     if (state.step === "postal_confirm") {
@@ -514,14 +628,21 @@ app.post("/twilio/collect", async (req, res) => {
           actionUrl: "/twilio/collect",
           mode: "speech",
         });
-        res.type("text/xml"); return res.send(twiml.toString());
-      }
-      if (digits !== "1") {
-        sayAndGather({ twiml, prompt: "Press 1 to confirm the postal code, or press 2 to say it again.", actionUrl: "/twilio/collect", mode: "dtmf" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
-      // Compute driving distance
+      if (digits !== "1") {
+        sayAndGather({
+          twiml,
+          prompt: "Press 1 to confirm the postal code, or press 2 to say it again.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
       const dist = await getDrivingDistanceKm(YARD_POSTAL, state.pickupPostal);
       if (dist.ok) {
         state.distanceKm = dist.km;
@@ -535,18 +656,26 @@ app.post("/twilio/collect", async (req, res) => {
       state.step = "condition";
       sayAndGather({
         twiml,
-        prompt: "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
+        prompt:
+          "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
     // 9) condition + finalize
     if (state.step === "condition") {
       if (!speech) {
-        sayAndGather({ twiml, prompt: "Sorry, I did not catch the condition. Please describe it again.", actionUrl: "/twilio/collect", mode: "speech" });
-        res.type("text/xml"); return res.send(twiml.toString());
+        sayAndGather({
+          twiml,
+          prompt: "Sorry, I did not catch the condition. Please describe it again.",
+          actionUrl: "/twilio/collect",
+          mode: "speech",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
       }
 
       const condition = speech;
@@ -560,72 +689,74 @@ app.post("/twilio/collect", async (req, res) => {
 
       const priceText = `$${min} to $${max}`;
 
-      // Save to Google Sheet (keeps your original 11 columns, appends extras)
+      // Write to Google Sheet (deterministic next row)
       try {
         const auth = getGoogleAuth();
         await auth.authorize();
 
         const notes = `CallSid=${state.callSid} | To=${state.to} | Condition=${condition}`;
 
-        await sheets.spreadsheets.values.append({
-          auth,
-          spreadsheetId: process.env.GOOGLE_SHEET_ID,
-          range: "Sheet1!A:Z",
-          valueInputOption: "RAW",
-          requestBody: {
-            values: [[
-              state.timestamp,          // Timestamp
-              "",                       // Caller Name
-              state.from,               // Phone Number
-              state.year,               // Car Year
-              state.make,               // Car Make
-              state.model,              // Car Model
-              state.drives ? "Yes" : "No", // Drives?
-              state.mileageKm,          // Mileage
-              priceText,                // AI price Given
-              state.cityNorm || state.cityRaw, // Location
-              notes,                    // Notes
-
-              // ---- appended extra columns (to the right) ----
-              state.askingPrice,        // AskingPrice
-              state.distanceKm ?? "",   // DistanceKm
-              state.pickupPostal || "", // PickupPostal
-              state.cityRaw || "",      // CityRaw
-              state.cityScore || "",    // CityScore
-              state.ruleApplied || "",  // RuleApplied
-            ]],
-          },
-        });
+        await appendRowDeterministic(auth, [
+          state.timestamp, // Timestamp
+          "", // Caller Name
+          state.from, // Phone Number
+          state.year, // Car Year
+          state.make, // Car Make
+          state.model, // Car Model
+          state.drives ? "Yes" : "No", // Drives?
+          state.mileageKm, // Mileage
+          priceText, // AI price Given
+          state.cityNorm || state.cityRaw, // Location (city normalized)
+          notes, // Notes
+          state.askingPrice, // AskingPrice
+          state.distanceKm ?? "", // Distance to Yard (KM)
+          state.pickupPostal || "", // PickupPostal
+          state.cityRaw || "", // CityRaw
+          state.cityScore || "", // CityScore
+          state.ruleApplied || "", // RuleApplied
+        ]);
       } catch (err) {
         console.error("Sheet append failed:", err);
       }
 
-      // Speak result
+      // Voice response
       const distPhrase =
         typeof state.distanceKm === "number" ? ` about ${state.distanceKm} kilometers away` : "";
+
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
-        `Thanks. For your ${state.year} ${state.make} ${state.model} in ${state.cityNorm || state.cityRaw}${distPhrase}, our rough estimate is ${priceText}.`
+        `Thanks. For your ${state.year} ${state.make} ${state.model} in ${
+          state.cityNorm || state.cityRaw
+        }${distPhrase}, our rough estimate is ${priceText}.`
       );
+
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
         "A human will confirm the final offer shortly. Goodbye."
       );
+
       twiml.hangup();
 
       callState.delete(callSid);
-      res.type("text/xml"); return res.send(twiml.toString());
+      res.type("text/xml");
+      return res.send(twiml.toString());
     }
 
-    // fallback
-    twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, "Sorry, something went wrong. Please call again.");
+    // Fallback
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Sorry, something went wrong. Please call again."
+    );
     twiml.hangup();
     callState.delete(callSid);
     res.type("text/xml");
     return res.send(twiml.toString());
   } catch (err) {
-    console.error("Error in collect:", err);
-    twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, "Sorry, we had a system error. Please call again later.");
+    console.error("Error in /twilio/collect:", err);
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      "Sorry, we had a system error. Please call again later."
+    );
     twiml.hangup();
     callState.delete(callSid);
     res.type("text/xml");
