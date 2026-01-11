@@ -741,6 +741,14 @@ app.post("/twilio/collect", async (req, res) => {
           state.cityRaw || "", // CityRaw
           state.cityScore || "", // CityScore
           state.ruleApplied || "", // RuleApplied
+          state.autoOfferEligible ? "Yes" : "No",
+          state.autoOfferInitial || "",
+          state.autoOfferFinal || "",
+          state.autoOfferStatus || "",
+          state.callbackBestNumber || "",
+          state.callbackNumber || "",
+          state.desiredPrice || "",
+          
         ]);
       } catch (err) {
         console.error("Sheet append failed:", err);
