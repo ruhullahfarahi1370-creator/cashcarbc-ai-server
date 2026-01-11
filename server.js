@@ -181,55 +181,6 @@ function getOrCreateState(callSid, req) {
   return callState.get(callSid);
 }
 
-async function writeToSheetSafe(state) {
-  try {
-    const auth = getGoogleAuth();
-    await auth.authorize();
-
-    const notesParts = [
-      `CallSid=${state.callSid}`,
-      `To=${state.to}`,
-      state.condition ? `Condition=${state.condition}` : "",
-    ].filter(Boolean);
-
-    const notes = notesParts.join(" | ");
-
-    // Price field: prefer auto-offer final if present, else range if present
-    const priceGiven = state.autoOfferFinal
-      ? `$${state.autoOfferFinal}`
-      : state.priceText || "";
-
-    await appendRowDeterministic(auth, [
-      state.timestamp,              // Timestamp
-      "",                           // Caller Name
-      state.from,                   // Phone Number
-      state.year,                   // Car Year
-      state.make,                   // Car Make
-      state.model,                  // Car Model
-      state.drives ? "Yes" : "No",  // Drives?
-      state.mileageKm,              // Mileage
-      priceGiven,                   // AI price given
-      state.cityNorm || state.cityRaw, // City
-      notes,                        // Notes
-      state.askingPrice,            // AskingPrice
-      state.distanceKm ?? "",       // Distance KM
-      state.pickupPostal || "",     // PickupPostal
-      state.cityRaw || "",          // CityRaw
-      state.cityScore || "",        // CityScore
-      state.ruleApplied || "",      // RuleApplied
-      state.autoOfferEligible ? "Yes" : "No",
-      state.autoOfferInitial || "",
-      state.autoOfferFinal || "",
-      state.autoOfferStatus || "",
-      state.callbackBestNumber || "",
-      state.callbackNumber || "",
-      state.desiredPrice || "",
-    ]);
-  } catch (err) {
-    console.error("Sheet append failed:", err);
-  }
-}
-
 function endCallAndCleanup(res, twiml, callSid) {
   twiml.hangup();
   callState.delete(callSid);
