@@ -2,6 +2,14 @@ import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
 import { google } from "googleapis";
+import {
+  isOldNonDrivableEligible,
+  getInitialOffer,
+  evaluateCounterOffer,
+  needsManagerReview,
+  parseDesiredPrice,
+} from "./offerRules.js";
+
 
 const PORT = process.env.PORT || 3000;
 
@@ -273,12 +281,16 @@ const callState = new Map();
 function getOrCreateState(callSid, req) {
   if (!callState.has(callSid)) {
     callState.set(callSid, {
+      // flow control
       step: "drives",
+
+      // call metadata
       from: req.body.From || "",
       to: req.body.To || "",
       callSid,
       timestamp: new Date().toISOString(),
 
+      // vehicle basics
       drives: null,
       year: "",
       make: "",
@@ -286,17 +298,32 @@ function getOrCreateState(callSid, req) {
       mileageKm: "",
       askingPrice: "",
 
+      // location
       cityRaw: "",
       cityNorm: "",
       cityScore: 0,
-
       pickupPostal: "",
       distanceKm: null,
+
+      // pricing / rules
       ruleApplied: "N/A",
+
+      // ===== AUTO-OFFER FLOW (old non-drivable cars) =====
+      autoOfferEligible: false,   // Yes / No
+      autoOfferInitial: "",       // "300"
+      autoOfferFinal: "",         // "300" or "350" or counter
+      autoOfferStatus: "",        // ACCEPTED_300 / ACCEPTED_COUNTER / ACCEPTED_MAX / MANAGER_REVIEW
+
+      desiredPrice: "",           // caller’s counter after rejecting $300
+
+      // callback handling (if final rejected)
+      callbackBestNumber: "Yes",  // Yes / No
+      callbackNumber: "",         // if No, store entered number
     });
   }
   return callState.get(callSid);
 }
+
 
 // ----- START CALL -----
 app.post("/twilio/voice", async (req, res) => {
