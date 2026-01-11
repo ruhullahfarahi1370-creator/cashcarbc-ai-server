@@ -17,52 +17,6 @@ import {
 // import fetch from "node-fetch";
 
 
-
-
-// ----- Google Auth -----
-function getGoogleAuth() {
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT env var is missing");
-  }
-  if (!process.env.GOOGLE_SHEET_ID) {
-    throw new Error("GOOGLE_SHEET_ID env var is missing");
-  }
-
-  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
-
-  // Fix escaped newlines in env vars (common on Render)
-  if (serviceAccount.private_key) {
-    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
-  }
-
-  return new google.auth.JWT(
-    serviceAccount.client_email,
-    null,
-    serviceAccount.private_key,
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-}
-
-// ----- Deterministic sheet write (always next row based on Column A) -----
-async function appendRowDeterministic(auth, rowValues) {
-  const colA = await sheets.spreadsheets.values.get({
-    auth,
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "Sheet1!A:A",
-  });
-
-  const values = colA.data.values || [];
-  const nextRow = values.length + 1; // A1 is header
-
-  await sheets.spreadsheets.values.update({
-    auth,
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: `Sheet1!A${nextRow}`,
-    valueInputOption: "RAW",
-    requestBody: { values: [rowValues] },
-  });
-}
-
 // ----- PRICING LOGIC (basic placeholder tiers) -----
 function calculatePriceRange({ drives, year, location, distanceKm }) {
   let min = drives ? 300 : 120;
@@ -702,7 +656,7 @@ app.post("/twilio/collect", async (req, res) => {
 
       state.priceText = `$${min} to $${max}`;
 
-      await writeToSheetSafe(state);
+      try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
       const distPhrase =
         typeof state.distanceKm === "number" ? ` about ${state.distanceKm} kilometers away` : "";
@@ -729,7 +683,7 @@ app.post("/twilio/collect", async (req, res) => {
         state.autoOfferStatus = "ACCEPTED_300";
         state.ruleApplied = "AutoOfferAccepted";
 
-        await writeToSheetSafe(state);
+        try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -823,7 +777,7 @@ if (state.step === "auto_offer_counter") {
   state.autoOfferStatus = "ACCEPTED_COUNTER";
   state.ruleApplied = "AutoOfferCounterAccepted";
 
-  await writeToSheetSafe(state);
+  try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
   twiml.say(
     { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -839,7 +793,7 @@ if (state.step === "auto_offer_cap_confirm") {
     state.autoOfferStatus = "ACCEPTED_MAX";
     state.ruleApplied = "AutoOfferMaxAccepted";
 
-    await writeToSheetSafe(state);
+    try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
     twiml.say(
       { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -883,7 +837,7 @@ if (state.step === "auto_offer_cap_confirm") {
         state.callbackBestNumber = "Yes";
         state.callbackNumber = "";
 
-        await writeToSheetSafe(state);
+        try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -931,7 +885,7 @@ if (state.step === "auto_offer_cap_confirm") {
 
       state.callbackNumber = n;
 
-      await writeToSheetSafe(state);
+      try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
 
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
