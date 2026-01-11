@@ -1,4 +1,5 @@
 import express from "express";
+import { validateTwilioRequest } from "./src/middleware/validateTwilio.js";
 import bodyParser from "body-parser";
 import { PORT, YARD_POSTAL, KNOWN_CITIES } from "./src/config/constants.js";
 import { getDrivingDistanceKm } from "./src/services/distanceMatrix.js";
