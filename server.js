@@ -862,63 +862,122 @@ app.post("/twilio/collect", async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    // 11) auto_offer_counter: parse desired price and decide (this is where $350 gets accepted)
-    if (state.step === "auto_offer_counter") {
-      const desired = parseDesiredPrice(digits);
-      if (!desired) {
-        sayAndGather({
-          twiml,
-          prompt: "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
-          actionUrl: "/twilio/collect",
-          mode: "dtmf",
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
+  // 11) auto_offer_counter: parse desired price and decide (this is where $350 gets accepted)
+if (state.step === "auto_offer_counter") {
+  const parsed = parseDesiredPrice(digits);
 
-      state.desiredPrice = String(desired);
+  // Your offerRules.parseDesiredPrice returns { ok, value, raw }
+  if (!parsed?.ok) {
+    sayAndGather({
+      twiml,
+      prompt:
+        "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+    });
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
-      const decision = evaluateCounterOffer({
-        initialOffer: Number(state.autoOfferInitial || 300),
-        desiredOffer: desired,
-        year: state.year,
-        distanceKm: state.distanceKm,
-        condition: state.condition,
-      });
+  const desiredValue = parsed.value;
+  state.desiredPrice = String(desiredValue);
 
-      // If your evaluateCounterOffer returns a finalOffer, use it; otherwise treat desired as candidate.
-      const proposedFinal = Number(decision?.finalOffer ?? desired);
+  // Correct call signature for your offerRules.js
+  const decision = evaluateCounterOffer({
+    make: state.make,
+    desiredPrice: desiredValue,
+  });
 
-      if (needsManagerReview({ desiredOffer: desired, decision })) {
-        state.autoOfferFinal = "";
-        state.autoOfferStatus = "MANAGER_REVIEW";
-        state.ruleApplied = "AutoOfferManagerReview";
+  if (!decision?.ok) {
+    sayAndGather({
+      twiml,
+      prompt:
+        "Sorry, I could not process that offer. Please enter your price again, for example 350.",
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+    });
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
-        state.step = "callback_best_number";
-        sayAndGather({
-          twiml,
-          prompt:
-            "Thanks. That offer needs a quick manager review. We'll call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
-          actionUrl: "/twilio/collect",
-          mode: "dtmf",
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
+  // If user asked above cap, decision.finalOffer will be maxOffer (300 or 350)
+  const proposedFinal = Number(decision.finalOffer);
 
-      // Accept counter (this is where $350 should be accepted)
-      state.autoOfferFinal = String(proposedFinal);
-      state.autoOfferStatus = "ACCEPTED_COUNTER";
-      state.ruleApplied = "AutoOfferCounterAccepted";
+  // If they asked ABOVE cap, we should present the capped offer and ask to accept it.
+  if (decision.decision === "CAP_AT_MAX") {
+    state.autoOfferFinal = String(proposedFinal);
+    state.autoOfferStatus = "COUNTERED_AT_MAX";
+    state.ruleApplied = "AutoOfferCappedToMax";
 
-      await writeToSheetSafe(state);
+    state.step = "auto_offer_cap_confirm";
+    sayAndGather({
+      twiml,
+      prompt: `The best we can do is $${state.autoOfferFinal}. Press 1 to accept. Press 2 to reject.`,
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+    });
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
-      twiml.say(
-        { voice: "Polly-Matthew-Neural", language: "en-CA" },
-        `Okay. We can do $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
-      );
-      return endCallAndCleanup(res, twiml, callSid);
-    }
+  // If desired <= maxOffer (e.g., Toyota/Honda desired=350), accept immediately
+  state.autoOfferFinal = String(proposedFinal);
+  state.autoOfferStatus = "ACCEPTED_COUNTER";
+  state.ruleApplied = "AutoOfferCounterAccepted";
+
+  await writeToSheetSafe(state);
+
+  twiml.say(
+    { voice: "Polly-Matthew-Neural", language: "en-CA" },
+    `Okay. We can do $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
+  );
+  return endCallAndCleanup(res, twiml, callSid);
+}
+
+    // 11b) auto_offer_cap_confirm: user accepts/rejects capped max offer
+if (state.step === "auto_offer_cap_confirm") {
+  if (digits === "1") {
+    // accepted capped offer (e.g., $350)
+    state.autoOfferStatus = "ACCEPTED_MAX";
+    state.ruleApplied = "AutoOfferMaxAccepted";
+
+    await writeToSheetSafe(state);
+
+    twiml.say(
+      { voice: "Polly-Matthew-Neural", language: "en-CA" },
+      `Perfect. We have accepted $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
+    );
+    return endCallAndCleanup(res, twiml, callSid);
+  }
+
+  if (digits === "2") {
+    // rejected final offer -> manager review needed
+    state.autoOfferStatus = "MANAGER_REVIEW";
+    state.ruleApplied = "AutoOfferRejectedFinal";
+
+    state.step = "callback_best_number";
+    sayAndGather({
+      twiml,
+      prompt:
+        "No problem. We'll have a manager review this and call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+    });
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
+
+  sayAndGather({
+    twiml,
+    prompt: "Press 1 to accept, or press 2 to reject.",
+    actionUrl: "/twilio/collect",
+    mode: "dtmf",
+  });
+  res.type("text/xml");
+  return res.send(twiml.toString());
+}
+
+
 
     // 12) callback_best_number
     if (state.step === "callback_best_number") {
