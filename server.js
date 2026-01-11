@@ -165,7 +165,7 @@ function endCallAndCleanup(res, twiml, callSid) {
 }
 
 // ----- START CALL -----
-app.post("/twilio/voice", async (req, res) => {
+app.post("/twilio/voice", validateTwilioRequest, async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
 
@@ -188,7 +188,7 @@ app.post("/twilio/voice", async (req, res) => {
 });
 
 // ----- COLLECT FLOW -----
-app.post("/twilio/collect", async (req, res) => {
+app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
   const state = getOrCreateState(callSid, req);
