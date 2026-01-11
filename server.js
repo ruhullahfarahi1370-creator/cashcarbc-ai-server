@@ -2,9 +2,9 @@ import express from "express";
 import bodyParser from "body-parser";
 import { PORT, YARD_POSTAL, KNOWN_CITIES, GOOGLE_MAPS_API_KEY } from "./src/config/constants.js";
 import { normalizeCity } from "./src/utils/city.js";
+import { writeLeadToSheet } from "./src/services/googleSheets.js";
 import { extractPostalCodeFromSpeech } from "./src/utils/postal.js";
 import twilio from "twilio";
-import { google } from "googleapis";
 import {
   isOldNonDrivableEligible,
   getInitialOffer,
@@ -17,8 +17,7 @@ import {
 // import fetch from "node-fetch";
 
 
-// Google Sheets
-const sheets = google.sheets("v4");
+
 
 // ----- Google Auth -----
 function getGoogleAuth() {
