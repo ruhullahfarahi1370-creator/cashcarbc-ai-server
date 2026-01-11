@@ -1,6 +1,6 @@
 import express from "express";
 import bodyParser from "body-parser";
-import { PORT, YARD_POSTAL, KNOWN_CITIES } from "./src/config/constants.js";
+import { PORT, YARD_POSTAL, KNOWN_CITIES, CITY_ALIASES, GOOGLE_MAPS_API_KEY } from "./src/config/constants.js";
 import twilio from "twilio";
 import { google } from "googleapis";
 import {
