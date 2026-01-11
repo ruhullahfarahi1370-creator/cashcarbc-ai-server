@@ -1,6 +1,8 @@
 import express from "express";
 import bodyParser from "body-parser";
-import { PORT, YARD_POSTAL, KNOWN_CITIES, CITY_ALIASES, GOOGLE_MAPS_API_KEY } from "./src/config/constants.js";
+import { PORT, YARD_POSTAL, KNOWN_CITIES, GOOGLE_MAPS_API_KEY } from "./src/config/constants.js";
+import { normalizeCity } from "./src/utils/city.js";
+import { extractPostalCodeFromSpeech } from "./src/utils/postal.js";
 import twilio from "twilio";
 import { google } from "googleapis";
 import {
@@ -105,74 +107,6 @@ function calculatePriceRange({ drives, year, location, distanceKm }) {
   max = Math.max(max, min + 50);
 
   return { min: Math.round(min), max: Math.round(max) };
-}
-
-// ----- Helpers -----
-function cleanText(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function levenshtein(a, b) {
-  const m = a.length,
-    n = b.length;
-  if (m === 0) return n;
-  if (n === 0) return m;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-    }
-  }
-  return dp[m][n];
-}
-
-function similarityScore(a, b) {
-  const aa = cleanText(a);
-  const bb = cleanText(b);
-  const maxLen = Math.max(aa.length, bb.length);
-  if (maxLen === 0) return 0;
-  return 1 - levenshtein(aa, bb) / maxLen;
-}
-
-function normalizeCity(spoken) {
-  const raw = String(spoken || "").trim();
-  const cleaned = cleanText(raw);
-
-  if (cleaned && CITY_ALIASES[cleaned]) {
-    return { raw, normalized: CITY_ALIASES[cleaned], score: 1.0, method: "alias" };
-  }
-
-  let best = "";
-  let bestScore = 0;
-
-  for (const city of KNOWN_CITIES) {
-    const s = similarityScore(cleaned, city);
-    if (s > bestScore) {
-      bestScore = s;
-      best = city;
-    }
-  }
-
-  const normalized = bestScore >= 0.62 ? best : raw || best;
-  return { raw, normalized, score: Number(bestScore.toFixed(3)), method: "fuzzy" };
-}
-
-// ----- Postal code extraction (speech) -----
-function extractPostalCodeFromSpeech(speech) {
-  const raw = String(speech || "").toUpperCase();
-  const cleaned = raw.replace(/[^A-Z0-9]/g, "");
-  const match = cleaned.match(/([A-Z]\d[A-Z]\d[A-Z]\d)/); // A1A1A1
-  if (!match) return { ok: false, raw, postal: "" };
-
-  const p = match[1];
-  return { ok: true, raw, postal: `${p.slice(0, 3)} ${p.slice(3)}` };
 }
 
 // ----- Google Distance Matrix -----
