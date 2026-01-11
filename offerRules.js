@@ -22,21 +22,22 @@ export function getMaxOffer(make) {
   return 300;
 }
 
+// Return a NUMBER or null (server code becomes much simpler)
 export function parseDesiredPrice(inputDigitsOrText) {
   const raw = String(inputDigitsOrText || "").replace(/,/g, "");
   const match = raw.match(/\d{2,7}/);
-  if (!match) return { ok: false, value: null, raw };
+  if (!match) return null;
 
   const value = parseInt(match[0], 10);
-  if (!Number.isFinite(value) || value <= 0) return { ok: false, value: null, raw };
+  if (!Number.isFinite(value) || value <= 0) return null;
 
-  return { ok: true, value, raw };
+  return value;
 }
 
 /**
  * If caller rejects $300, we ask "how much do you want?"
  * - If desired <= maxOffer -> accept at desired
- * - If desired > maxOffer -> cap final offer to maxOffer (300 or 350)
+ * - If desired > maxOffer -> counter at maxOffer (300 or 350)
  */
 export function evaluateCounterOffer({ make, desiredPrice }) {
   const maxOffer = getMaxOffer(make);
@@ -65,12 +66,15 @@ export function evaluateCounterOffer({ make, desiredPrice }) {
     ok: true,
     maxOffer,
     finalOffer: maxOffer,
-    decision: "CAP_AT_MAX",
-    message: `Desired price $${desiredPrice} is above cap. Final offer is $${maxOffer}.`,
+    decision: "COUNTER_MAX",
+    message: `Desired $${desiredPrice} is above cap. Counter at $${maxOffer}.`,
   };
 }
 
-// If caller rejects even the capped max offer, manager review is needed.
+/**
+ * Manager review only if caller rejects the FINAL offer you gave them.
+ * Call like: needsManagerReview({ acceptedFinal: false })
+ */
 export function needsManagerReview({ acceptedFinal }) {
   return acceptedFinal === false;
 }
