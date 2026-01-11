@@ -1,5 +1,6 @@
 import express from "express";
 import bodyParser from "body-parser";
+import { PORT, YARD_POSTAL, KNOWN_CITIES } from "./src/config/constants.js";
 import twilio from "twilio";
 import { google } from "googleapis";
 import {
@@ -13,13 +14,6 @@ import {
 // If your Node runtime doesn't have global fetch (Node < 18), uncomment below:
 // import fetch from "node-fetch";
 
-const PORT = process.env.PORT || 3000;
-
-// Yard postal code (your base)
-const YARD_POSTAL = "V6V 1M7";
-
-// Google Maps key for Distance Matrix
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 
 // Google Sheets
 const sheets = google.sheets("v4");
@@ -146,35 +140,6 @@ function similarityScore(a, b) {
   if (maxLen === 0) return 0;
   return 1 - levenshtein(aa, bb) / maxLen;
 }
-
-// ----- City normalization -----
-const KNOWN_CITIES = [
-  "Vancouver",
-  "Burnaby",
-  "Richmond",
-  "Surrey",
-  "Langley",
-  "Coquitlam",
-  "Port Coquitlam",
-  "Port Moody",
-  "Maple Ridge",
-  "Pitt Meadows",
-  "Abbotsford",
-  "Chilliwack",
-  "Mission",
-  "Delta",
-  "North Vancouver",
-  "West Vancouver",
-  "New Westminster",
-];
-
-const CITY_ALIASES = {
-  hobbits: "Abbotsford",
-  hobits: "Abbotsford",
-  abotsford: "Abbotsford",
-  vancover: "Vancouver",
-  surree: "Surrey",
-};
 
 function normalizeCity(spoken) {
   const raw = String(spoken || "").trim();
