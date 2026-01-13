@@ -1,134 +1,95 @@
 // src/flows/postalFlow.js
-import twilio from "twilio";
 import { extractPostalCodeFromSpeech } from "../utils/postal.js";
-import { extractCityFromSpeech } from "../utils/city.js"; // if you already have it; if not, remove city part.
-
-const { VoiceResponse } = twilio.twiml;
-
-function saidYes(text) {
-  const t = String(text || "").toLowerCase();
-  return /\b(yes|yeah|yep|correct|right|that'?s right|sure|ok|okay)\b/.test(t);
-}
-
-function saidNo(text) {
-  const t = String(text || "").toLowerCase();
-  return /\b(no|nope|nah|incorrect|wrong|not correct)\b/.test(t);
-}
 
 /**
- * Handles postal step + confirm + retries + fallback, without bloating controller.
+ * Postal flow module (DTMF confirm) that matches twilioController.js.
  *
- * Inputs:
- *  - state: your call state object
- *  - speech: SpeechResult / recognized text
+ * Steps handled:
+ *  - "postal"         (speech)  -> parse postal -> prompt DTMF confirm
+ *  - "postal_confirm" (dtmf)    -> 1 confirm, 2 retry
  *
- * Output:
- *  - twiml (VoiceResponse)
- *  - nextStep string (optional)
- *  - statePatch object (optional)
+ * It does NOT call distance APIs. On confirm, it returns { confirmed: true }
+ * so the controller can continue with distance + condition.
+ *
+ * Expected inputs (passed from controller):
+ *  - state
+ *  - speech
+ *  - digits
+ *  - twiml (VoiceResponse instance created in controller)
+ *  - sayAndGather (helper)
  */
-export function handlePostalFlow(state, speech) {
-  const vr = new VoiceResponse();
-  const currentStep = state.step;
+export function handlePostalFlow({ state, speech, digits, twiml, sayAndGather }) {
+  // --- Step: postal (speech) ---
+  if (state.step === "postal") {
+    const parsed = extractPostalCodeFromSpeech(speech);
 
-  // ---- CONFIRM FULL POSTAL ----
-  if (currentStep === "confirm_postal") {
-    if (saidYes(speech)) {
-      vr.say("Perfect. Thanks.");
-      return { twiml: vr, nextStep: "next_step_after_location" };
+    // If we can't parse, retry (you can add retry counters later if you want)
+    if (!parsed?.ok) {
+      sayAndGather({
+        twiml,
+        prompt:
+          "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+        timeoutSec: 12,
+      });
+      return { handled: true };
     }
-    if (saidNo(speech)) {
-      vr.say("No problem. Please say the postal code again.");
-      return {
-        twiml: vr,
-        nextStep: "postal",
-        statePatch: { pickupPostal: "", postalFSA: "", postalRetries: 0 },
-      };
+
+    // Save (full postal if available; otherwise you could store FSA only)
+    if (parsed.postal) state.pickupPostal = parsed.postal;
+    if (parsed.fsa) state.postalFSA = parsed.fsa;
+
+    state.step = "postal_confirm";
+
+    // Confirm via DTMF (same behavior as your old controller)
+    sayAndGather({
+      twiml,
+      prompt: `I heard ${state.pickupPostal || state.postalFSA}. Press 1 to confirm. Press 2 to say it again.`,
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+      timeoutSec: 12,
+    });
+
+    return { handled: true };
+  }
+
+  // --- Step: postal_confirm (DTMF) ---
+  if (state.step === "postal_confirm") {
+    if (digits === "2") {
+      // retry
+      state.pickupPostal = "";
+      state.postalFSA = "";
+      state.step = "postal";
+
+      sayAndGather({
+        twiml,
+        prompt: "Okay. Please say your postal code again.",
+        actionUrl: "/twilio/collect",
+        mode: "speech",
+        timeoutSec: 12,
+      });
+
+      return { handled: true };
     }
-    vr.say("Sorry, please say yes or no. Is that postal code correct?");
-    return { twiml: vr, nextStep: "confirm_postal" };
-  }
 
-  // ---- CONFIRM FSA ----
-  if (currentStep === "confirm_fsa") {
-    if (saidYes(speech)) {
-      vr.say("Great. Thanks.");
-      return { twiml: vr, nextStep: "next_step_after_location" };
+    if (digits !== "1") {
+      // invalid input, ask again
+      sayAndGather({
+        twiml,
+        prompt: "Press 1 to confirm the postal code, or press 2 to say it again.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
+        timeoutSec: 12,
+      });
+
+      return { handled: true };
     }
-    if (saidNo(speech)) {
-      vr.say("No worries. Please say the postal code again.");
-      return {
-        twiml: vr,
-        nextStep: "postal",
-        statePatch: { postalFSA: "", postalRetries: 0 },
-      };
-    }
-    vr.say("Sorry, please say yes or no. Is that correct?");
-    return { twiml: vr, nextStep: "confirm_fsa" };
+
+    // Confirmed
+    return { confirmed: true };
   }
 
-  // ---- MAIN POSTAL STEP ----
-  // Try to extract postal/FSA
-  const r = extractPostalCodeFromSpeech(speech);
-
-  if (r.ok && r.confidence === "high" && r.postal) {
-    vr.say(`Just to confirm, I heard ${r.postal}. Is that correct?`);
-    return {
-      twiml: vr,
-      nextStep: "confirm_postal",
-      statePatch: {
-        pickupPostal: r.postal,
-        postalFSA: r.fsa || r.postal.replace(/[^A-Z0-9]/g, "").slice(0, 3),
-        postalRetries: 0,
-      },
-    };
-  }
-
-  if (r.ok && r.confidence === "medium" && r.fsa) {
-    vr.say(`I heard ${r.fsa}. Is that correct?`);
-    return {
-      twiml: vr,
-      nextStep: "confirm_fsa",
-      statePatch: { postalFSA: r.fsa, postalRetries: 0 },
-    };
-  }
-
-  // Optional: fallback to city (only if you already collect cities and have a util)
-  let city = null;
-  try {
-    const c = extractCityFromSpeech(speech);
-    if (c?.cityNorm) city = c.cityNorm;
-  } catch {
-    // ignore if you don't have city util wired
-  }
-
-  if (city) {
-    vr.say(`Got it. You're in ${city}, correct?`);
-    return {
-      twiml: vr,
-      nextStep: "confirm_city",
-      statePatch: { cityNorm: city, postalRetries: 0 },
-    };
-  }
-
-  // Retry logic (kept here, not controller)
-  const retries = Number(state.postalRetries || 0) + 1;
-
-  if (retries <= 1) {
-    vr.say("No worries. Please say the postal code again, slowly.");
-    vr.say("For example: V five J one N four.");
-    return {
-      twiml: vr,
-      nextStep: "postal",
-      statePatch: { postalRetries: retries },
-    };
-  }
-
-  // Final fallback
-  vr.say("No problem. What city is the car located in?");
-  return {
-    twiml: vr,
-    nextStep: "city",
-    statePatch: { postalRetries: retries },
-  };
+  // Not handled by this module
+  return { handled: false };
 }
