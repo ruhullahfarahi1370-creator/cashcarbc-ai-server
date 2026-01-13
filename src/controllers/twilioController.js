@@ -5,7 +5,6 @@ import { YARD_POSTAL, KNOWN_CITIES } from "../config/constants.js";
 import { getDrivingDistanceKm } from "../services/distanceMatrix.js";
 import { normalizeCity } from "../utils/city.js";
 import { writeLeadToSheet } from "../services/googleSheets.js";
-import { extractPostalCodeFromSpeech } from "../utils/postal.js";
 
 import { getOrCreateState, deleteState } from "../state/callState.js";
 import { pickUserInput, sayAndGather, endCallAndCleanup } from "../twilio/twimlHelpers.js";
@@ -240,7 +239,6 @@ export async function twilioCollect(req, res) {
 
     // 3b) early_ask_price
     if (state.step === "early_ask_price") {
-      // use digits-only parse (most reliable for DTMF)
       const p = parseMoneyFromDigits(digits);
 
       if (!p.ok) {
@@ -260,14 +258,17 @@ export async function twilioCollect(req, res) {
       const desired = p.value;
       state.desiredPrice = String(desired);
 
-      // if below 300 => accept
       if (desired < 300) {
         state.autoOfferEligible = true;
         state.autoOfferFinal = String(desired);
         state.autoOfferStatus = "ACCEPTED_BELOW_300";
         state.ruleApplied = "EarlyAcceptedBelow300";
 
-        try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -276,7 +277,6 @@ export async function twilioCollect(req, res) {
         return endCallAndCleanup({ res, twiml, callSid, deleteState });
       }
 
-      // otherwise offer 350
       state.autoOfferEligible = true;
       state.autoOfferFinal = "350";
       state.autoOfferStatus = "OFFERED_350";
@@ -300,7 +300,11 @@ export async function twilioCollect(req, res) {
         state.autoOfferStatus = "ACCEPTED_350";
         state.ruleApplied = "EarlyAccepted350";
 
-        try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -336,8 +340,6 @@ export async function twilioCollect(req, res) {
       res.type("text/xml");
       return res.send(twiml.toString());
     }
-
-    // ---- The rest of your existing flow stays the same ----
 
     // 4) model
     if (state.step === "model") {
@@ -445,10 +447,6 @@ export async function twilioCollect(req, res) {
       return res.send(twiml.toString());
     }
 
-    // --- keep the rest of your controller unchanged from here ---
-    // (city -> postal -> condition -> auto-offer -> callback, etc.)
-    // For brevity, I’m keeping your original logic below untouched.
-
     // 7) city
     if (state.step === "city") {
       if (!speech) {
@@ -523,13 +521,33 @@ export async function twilioCollect(req, res) {
       return res.send(twiml.toString());
     }
 
-    if (state.step === "postal") {
-      const parsed = extractPostalCodeFromSpeech(speech);
+    // 8) postal + postal_confirm (delegated)
+    if (state.step === "postal" || state.step === "postal_confirm") {
+      const result = handlePostalFlow({ state, speech, digits, twiml, sayAndGather });
 
-      if (!parsed.ok) {
+      // If postalFlow handled the response (retry / confirm prompts), return now.
+      if (result?.handled) {
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
+
+      // If confirmed, continue with distance + condition
+      if (result?.confirmed) {
+        const dist = await getDrivingDistanceKm(YARD_POSTAL, state.pickupPostal);
+        if (dist.ok) {
+          state.distanceKm = dist.km;
+          state.ruleApplied = state.ruleApplied || "PostalDistanceUsed";
+        } else {
+          console.error(`[DIST] Failed: ${dist.error}`);
+          state.distanceKm = null;
+          state.ruleApplied = `DistanceFailed:${dist.error}`;
+        }
+
+        state.step = "condition";
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
+          prompt:
+            "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
           actionUrl: "/twilio/collect",
           mode: "speech",
           timeoutSec: 12,
@@ -537,67 +555,6 @@ export async function twilioCollect(req, res) {
         res.type("text/xml");
         return res.send(twiml.toString());
       }
-
-      state.pickupPostal = parsed.postal;
-      state.step = "postal_confirm";
-      sayAndGather({
-        twiml,
-        prompt: `I heard ${state.pickupPostal}. Press 1 to confirm. Press 2 to say it again.`,
-        actionUrl: "/twilio/collect",
-        mode: "dtmf",
-        timeoutSec: 12,
-      });
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
-
-    if (state.step === "postal_confirm") {
-      if (digits === "2") {
-        state.pickupPostal = "";
-        state.step = "postal";
-        sayAndGather({
-          twiml,
-          prompt: "Okay. Please say your postal code again.",
-          actionUrl: "/twilio/collect",
-          mode: "speech",
-          timeoutSec: 12,
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
-
-      if (digits !== "1") {
-        sayAndGather({
-          twiml,
-          prompt: "Press 1 to confirm the postal code, or press 2 to say it again.",
-          actionUrl: "/twilio/collect",
-          mode: "dtmf",
-          timeoutSec: 12,
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
-
-      const dist = await getDrivingDistanceKm(YARD_POSTAL, state.pickupPostal);
-      if (dist.ok) {
-        state.distanceKm = dist.km;
-        state.ruleApplied = state.ruleApplied || "PostalDistanceUsed";
-      } else {
-        console.error(`[DIST] Failed: ${dist.error}`);
-        state.distanceKm = null;
-        state.ruleApplied = `DistanceFailed:${dist.error}`;
-      }
-
-      state.step = "condition";
-      sayAndGather({
-        twiml,
-        prompt: "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
-        actionUrl: "/twilio/collect",
-        mode: "speech",
-        timeoutSec: 12,
-      });
-      res.type("text/xml");
-      return res.send(twiml.toString());
     }
 
     if (state.step === "condition") {
@@ -653,7 +610,11 @@ export async function twilioCollect(req, res) {
 
       state.priceText = `$${min} to $${max}`;
 
-      try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
       const distPhrase =
         typeof state.distanceKm === "number" ? ` about ${state.distanceKm} kilometers away` : "";
@@ -678,7 +639,11 @@ export async function twilioCollect(req, res) {
         state.autoOfferStatus = "ACCEPTED_300";
         state.ruleApplied = "AutoOfferAccepted";
 
-        try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -714,7 +679,6 @@ export async function twilioCollect(req, res) {
 
     // auto_offer_counter
     if (state.step === "auto_offer_counter") {
-      // your existing parse function; digits are sanitized already
       const parsed = parseDesiredPrice(digits);
 
       if (!parsed?.ok) {
@@ -774,7 +738,11 @@ export async function twilioCollect(req, res) {
       state.autoOfferStatus = "ACCEPTED_COUNTER";
       state.ruleApplied = "AutoOfferCounterAccepted";
 
-      try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -789,7 +757,11 @@ export async function twilioCollect(req, res) {
         state.autoOfferStatus = "ACCEPTED_MAX";
         state.ruleApplied = "AutoOfferMaxAccepted";
 
-        try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -832,7 +804,11 @@ export async function twilioCollect(req, res) {
         state.callbackBestNumber = "Yes";
         state.callbackNumber = "";
 
-        try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -885,7 +861,11 @@ export async function twilioCollect(req, res) {
 
       state.callbackNumber = n;
 
-      try { await writeLeadToSheet(state); } catch (err) { console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
