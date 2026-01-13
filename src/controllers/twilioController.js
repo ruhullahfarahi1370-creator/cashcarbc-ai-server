@@ -27,6 +27,15 @@ function isEarlyToyotaHondaOldNonDrive({ drives, year, make }) {
   return /\btoyota\b/.test(m) || /\bhonda\b/.test(m);
 }
 
+// robust numeric parse (DTMF or sanitized digits)
+function parseMoneyFromDigits(digits) {
+  const clean = String(digits || "").replace(/[^\d]/g, "");
+  if (!clean) return { ok: false };
+  const value = parseInt(clean, 10);
+  if (!Number.isFinite(value)) return { ok: false };
+  return { ok: true, value };
+}
+
 // ----- PRICING LOGIC (keep same for now) -----
 function calculatePriceRange({ drives, year, location, distanceKm }) {
   let min = drives ? 300 : 120;
@@ -87,6 +96,7 @@ export async function twilioVoice(req, res) {
     prompt: "Does the car drive? Press 1 for yes. Press 2 for no.",
     actionUrl: "/twilio/collect",
     mode: "dtmf",
+    timeoutSec: 12,
   });
 
   res.type("text/xml");
@@ -98,9 +108,12 @@ export async function twilioCollect(req, res) {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid || `no-callsid-${Date.now()}`;
   const state = getOrCreateState(callSid, req);
-  const { speech, digits } = pickUserInput(req);
 
-  console.log(`[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`);
+  const { speech, digits, rawDigits } = pickUserInput(req);
+
+  console.log(
+    `[COLLECT] CallSid=${callSid} step=${state.step} digits="${digits}" rawDigits="${rawDigits}" speech="${speech}"`
+  );
 
   try {
     // 1) drives
@@ -113,6 +126,7 @@ export async function twilioCollect(req, res) {
           prompt: "Press 1 if it drives, press 2 if it does not.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -125,6 +139,7 @@ export async function twilioCollect(req, res) {
         actionUrl: "/twilio/collect",
         mode: "dtmf",
         numDigits: 4,
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -141,6 +156,8 @@ export async function twilioCollect(req, res) {
           prompt: "Please enter a 4 digit year. For example, 2015.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          numDigits: 4,
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -153,6 +170,8 @@ export async function twilioCollect(req, res) {
           prompt: `That year is not valid. Please enter a year between 1900 and ${currentYear}.`,
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          numDigits: 4,
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -165,6 +184,7 @@ export async function twilioCollect(req, res) {
         prompt: "Now say the car make. For example, Toyota, Honda, Ford, or BMW.",
         actionUrl: "/twilio/collect",
         mode: "speech",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -178,6 +198,7 @@ export async function twilioCollect(req, res) {
           prompt: "Sorry, I did not catch the make. Please say it again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -185,20 +206,19 @@ export async function twilioCollect(req, res) {
 
       state.make = speech;
 
-      // EARLY SPECIAL FLOW:
-      // doesn't drive + 2001 or older + Toyota/Honda
+      // EARLY SPECIAL FLOW: doesn't drive + 2001 or older + Toyota/Honda
       if (isEarlyToyotaHondaOldNonDrive({ drives: state.drives, year: state.year, make: state.make })) {
         state.ruleApplied = "EarlyToyotaHondaOldNonDrive";
         state.step = "early_ask_price";
 
-        // IMPORTANT: allow DTMF or speech
         sayAndGather({
           twiml,
           prompt:
-            "How much would you like to sell it for? You can enter digits like 500, or say the amount.",
+            "How much would you like to sell it for? Enter the amount in dollars, then press pound. For example, 500 pound.",
           actionUrl: "/twilio/collect",
-          mode: "both",
+          mode: "dtmf",
           finishOnKey: "#",
+          timeoutSec: 20,
         });
 
         res.type("text/xml");
@@ -212,34 +232,35 @@ export async function twilioCollect(req, res) {
         prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
         actionUrl: "/twilio/collect",
         mode: "speech",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 3b) early_ask_price:
-    // If below 300 => accept
-    // Otherwise => offer 350, then if reject => manager callback flow
+    // 3b) early_ask_price
     if (state.step === "early_ask_price") {
-      // Parse from digits first, else speech (fixes your “dialed 500” issue)
-      const rawInput = (digits && digits.trim()) ? digits.trim() : (speech || "").trim();
-      const parsed = parseDesiredPrice(rawInput);
+      // use digits-only parse (most reliable for DTMF)
+      const p = parseMoneyFromDigits(digits);
 
-      if (!parsed?.ok) {
+      if (!p.ok) {
         sayAndGather({
           twiml,
           prompt:
-            "Sorry, I could not read that amount. Please enter digits like 250 or 500.",
+            "Sorry, I could not read that amount. Please enter the amount in dollars, then press pound. For example, 500 pound.",
           actionUrl: "/twilio/collect",
-          mode: "both",
+          mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
       }
 
-      const desired = parsed.value;
+      const desired = p.value;
       state.desiredPrice = String(desired);
 
+      // if below 300 => accept
       if (desired < 300) {
         state.autoOfferEligible = true;
         state.autoOfferFinal = String(desired);
@@ -255,6 +276,7 @@ export async function twilioCollect(req, res) {
         return endCallAndCleanup({ res, twiml, callSid, deleteState });
       }
 
+      // otherwise offer 350
       state.autoOfferEligible = true;
       state.autoOfferFinal = "350";
       state.autoOfferStatus = "OFFERED_350";
@@ -266,6 +288,7 @@ export async function twilioCollect(req, res) {
         prompt: "The best we can do is 350 dollars. Press 1 to accept. Press 2 to reject.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -297,6 +320,7 @@ export async function twilioCollect(req, res) {
             "No problem. We'll have a manager review this and call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -307,10 +331,13 @@ export async function twilioCollect(req, res) {
         prompt: "Press 1 to accept, or press 2 to reject.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
+
+    // ---- The rest of your existing flow stays the same ----
 
     // 4) model
     if (state.step === "model") {
@@ -320,19 +347,21 @@ export async function twilioCollect(req, res) {
           prompt: "Sorry, I did not catch the model. Please say it again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
       }
 
       state.model = speech;
-
       state.step = "mileage";
       sayAndGather({
         twiml,
-        prompt: "Enter the mileage in kilometers, numbers only. For example, enter 150000.",
+        prompt: "Enter the mileage in kilometers, numbers only, then press pound. For example, 150000 pound.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        finishOnKey: "#",
+        timeoutSec: 20,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -345,9 +374,11 @@ export async function twilioCollect(req, res) {
       if (!/^\d{1,6}$/.test(km)) {
         sayAndGather({
           twiml,
-          prompt: "Please enter mileage using numbers only. Example: 150000.",
+          prompt: "Please enter mileage using numbers only, then press pound. Example: 150000 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -357,9 +388,11 @@ export async function twilioCollect(req, res) {
       if (isNaN(kmNum) || kmNum < 0 || kmNum > 800000) {
         sayAndGather({
           twiml,
-          prompt: "That mileage seems unusual. Please enter it again. Example: 150000.",
+          prompt: "That mileage seems unusual. Please enter it again, then press pound. Example: 150000 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -370,10 +403,11 @@ export async function twilioCollect(req, res) {
       state.step = "asking_price";
       sayAndGather({
         twiml,
-        prompt:
-          "How much are you trying to sell the car for? Enter the amount in dollars, numbers only. For example, enter 1200.",
+        prompt: "How much are you trying to sell the car for? Enter the amount, then press pound. For example, 1200 pound.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        finishOnKey: "#",
+        timeoutSec: 20,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -386,9 +420,11 @@ export async function twilioCollect(req, res) {
       if (!/^\d{2,7}$/.test(ap)) {
         sayAndGather({
           twiml,
-          prompt: "Please enter the amount in dollars using numbers only. Example: 1200.",
+          prompt: "Please enter the amount in dollars using numbers only, then press pound. Example: 1200 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -399,15 +435,19 @@ export async function twilioCollect(req, res) {
       state.step = "city";
       sayAndGather({
         twiml,
-        prompt:
-          "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
+        prompt: "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
         actionUrl: "/twilio/collect",
         mode: "speech",
         hints: KNOWN_CITIES.join(", "),
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
+
+    // --- keep the rest of your controller unchanged from here ---
+    // (city -> postal -> condition -> auto-offer -> callback, etc.)
+    // For brevity, I’m keeping your original logic below untouched.
 
     // 7) city
     if (state.step === "city") {
@@ -418,6 +458,7 @@ export async function twilioCollect(req, res) {
           actionUrl: "/twilio/collect",
           mode: "speech",
           hints: KNOWN_CITIES.join(", "),
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -434,6 +475,7 @@ export async function twilioCollect(req, res) {
         prompt: `I heard ${state.cityNorm}. Press 1 to confirm. Press 2 to say it again.`,
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -451,6 +493,7 @@ export async function twilioCollect(req, res) {
           actionUrl: "/twilio/collect",
           mode: "speech",
           hints: KNOWN_CITIES.join(", "),
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -462,6 +505,7 @@ export async function twilioCollect(req, res) {
           prompt: "Press 1 to confirm the city, or press 2 to say it again.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -470,26 +514,25 @@ export async function twilioCollect(req, res) {
       state.step = "postal";
       sayAndGather({
         twiml,
-        prompt:
-          "To estimate distance, please say your postal code. For example, V six V one M seven.",
+        prompt: "To estimate distance, please say your postal code. For example, V six V one M seven.",
         actionUrl: "/twilio/collect",
         mode: "speech",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 8) postal
     if (state.step === "postal") {
       const parsed = extractPostalCodeFromSpeech(speech);
 
       if (!parsed.ok) {
         sayAndGather({
           twiml,
-          prompt:
-            "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
+          prompt: "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -502,6 +545,7 @@ export async function twilioCollect(req, res) {
         prompt: `I heard ${state.pickupPostal}. Press 1 to confirm. Press 2 to say it again.`,
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -516,6 +560,7 @@ export async function twilioCollect(req, res) {
           prompt: "Okay. Please say your postal code again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -527,6 +572,7 @@ export async function twilioCollect(req, res) {
           prompt: "Press 1 to confirm the postal code, or press 2 to say it again.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -545,16 +591,15 @@ export async function twilioCollect(req, res) {
       state.step = "condition";
       sayAndGather({
         twiml,
-        prompt:
-          "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
+        prompt: "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
         actionUrl: "/twilio/collect",
         mode: "speech",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 9) condition -> auto-offer OR normal range
     if (state.step === "condition") {
       if (!speech) {
         sayAndGather({
@@ -562,6 +607,7 @@ export async function twilioCollect(req, res) {
           prompt: "Sorry, I did not catch the condition. Please describe it again.",
           actionUrl: "/twilio/collect",
           mode: "speech",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -592,6 +638,7 @@ export async function twilioCollect(req, res) {
           prompt: `Based on the details, we can offer $${initial}. Press 1 to accept. Press 2 to make a counter offer.`,
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -624,7 +671,7 @@ export async function twilioCollect(req, res) {
       return endCallAndCleanup({ res, twiml, callSid, deleteState });
     }
 
-    // 10) auto_offer_present
+    // auto_offer_present
     if (state.step === "auto_offer_present") {
       if (digits === "1") {
         state.autoOfferFinal = state.autoOfferInitial;
@@ -644,10 +691,11 @@ export async function twilioCollect(req, res) {
         state.step = "auto_offer_counter";
         sayAndGather({
           twiml,
-          prompt:
-            "Okay. What price would you accept? Enter the amount in dollars, numbers only. For example, 350.",
+          prompt: "Okay. What price would you accept? Enter the amount, then press pound. For example, 350 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -658,22 +706,25 @@ export async function twilioCollect(req, res) {
         prompt: "Press 1 to accept the offer, or press 2 to make a counter offer.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 11) auto_offer_counter
+    // auto_offer_counter
     if (state.step === "auto_offer_counter") {
+      // your existing parse function; digits are sanitized already
       const parsed = parseDesiredPrice(digits);
 
       if (!parsed?.ok) {
         sayAndGather({
           twiml,
-          prompt:
-            "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
+          prompt: "Sorry, I could not read that amount. Please enter the amount, then press pound. For example, 350 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -690,10 +741,11 @@ export async function twilioCollect(req, res) {
       if (!decision?.ok) {
         sayAndGather({
           twiml,
-          prompt:
-            "Sorry, I could not process that offer. Please enter your price again, for example 350.",
+          prompt: "Sorry, I could not process that offer. Please enter your price again, then press pound. For example, 350 pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -712,6 +764,7 @@ export async function twilioCollect(req, res) {
           prompt: `The best we can do is $${state.autoOfferFinal}. Press 1 to accept. Press 2 to reject.`,
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -730,7 +783,7 @@ export async function twilioCollect(req, res) {
       return endCallAndCleanup({ res, twiml, callSid, deleteState });
     }
 
-    // 11b) auto_offer_cap_confirm
+    // auto_offer_cap_confirm
     if (state.step === "auto_offer_cap_confirm") {
       if (digits === "1") {
         state.autoOfferStatus = "ACCEPTED_MAX";
@@ -756,6 +809,7 @@ export async function twilioCollect(req, res) {
             "No problem. We'll have a manager review this and call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          timeoutSec: 12,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -766,12 +820,13 @@ export async function twilioCollect(req, res) {
         prompt: "Press 1 to accept, or press 2 to reject.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 12) callback_best_number
+    // callback_best_number
     if (state.step === "callback_best_number") {
       if (digits === "1") {
         state.callbackBestNumber = "Yes";
@@ -791,9 +846,11 @@ export async function twilioCollect(req, res) {
         state.step = "callback_number";
         sayAndGather({
           twiml,
-          prompt: "Please enter the best callback number now, including area code. Numbers only.",
+          prompt: "Please enter the best callback number now, then press pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -804,20 +861,23 @@ export async function twilioCollect(req, res) {
         prompt: "Press 1 for yes, or press 2 to enter a different callback number.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        timeoutSec: 12,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
-    // 13) callback_number
+    // callback_number
     if (state.step === "callback_number") {
       const n = String(digits || "").replace(/\D/g, "");
       if (n.length < 10 || n.length > 15) {
         sayAndGather({
           twiml,
-          prompt: "That number seems invalid. Please enter the callback number again, numbers only.",
+          prompt: "That number seems invalid. Please enter the callback number again, then press pound.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
+          finishOnKey: "#",
+          timeoutSec: 20,
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -834,7 +894,7 @@ export async function twilioCollect(req, res) {
       return endCallAndCleanup({ res, twiml, callSid, deleteState });
     }
 
-    // Fallback
+    // fallback
     twiml.say(
       { voice: "Polly-Matthew-Neural", language: "en-CA" },
       "Sorry, something went wrong. Please call again."
