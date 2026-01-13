@@ -162,10 +162,10 @@ export async function twilioCollect(req, res) {
       }
 
       state.year = y;
-      state.step = "make";
+      state.step = "";
       sayAndGather({
         twiml,
-        prompt: "Now say the car make. For example, Toyota, Honda, Ford, or BMW.",
+        prompt: "Now say the car . For example, Toyota, Honda, Ford, or BMW.",
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
@@ -173,66 +173,48 @@ export async function twilioCollect(req, res) {
       return res.send(twiml.toString());
     }
 
-    if (state.step === "make") {
-      if (!speech) {
-        sayAndGather({
-          twiml,
-          prompt: "Sorry, I did not catch the make. Please say it again.",
-          actionUrl: "/twilio/collect",
-          mode: "speech",
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
-      state.make = speech;
-      state.step = "model";
-      sayAndGather({
-        twiml,
-        prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
-        actionUrl: "/twilio/collect",
-        mode: "speech",
-      });
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
+if (state.step === "make") {
+  if (!speech) {
+    sayAndGather({
+      twiml,
+      prompt: "Sorry, I did not catch the make. Please say it again.",
+      actionUrl: "/twilio/collect",
+      mode: "speech",
+    });
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
-    if (state.step === "model") {
-      if (!speech) {
-        sayAndGather({
-          twiml,
-          prompt: "Sorry, I did not catch the model. Please say it again.",
-          actionUrl: "/twilio/collect",
-          mode: "speech",
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
-      state.model = speech;
+  state.make = speech;
 
-      state.step = "mileage";
-      sayAndGather({
-        twiml,
-        prompt: "Enter the mileage in kilometers, numbers only. For example, enter 150000.",
-        actionUrl: "/twilio/collect",
-        mode: "dtmf",
-      });
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
+  // EARLY SPECIAL FLOW: non-drivable + 2001 or older + Toyota/Honda
+  if (isEarlyToyotaHondaOldNonDrive({ drives: state.drives, year: state.year, make: state.make })) {
+    state.ruleApplied = "EarlyToyotaHondaOldNonDrive";
+    state.step = "early_ask_price";
 
-    if (state.step === "mileage") {
-      const km = digits;
+    sayAndGather({
+      twiml,
+      prompt:
+        "How much would you like to sell it for? Enter the amount in dollars, numbers only. For example, 250.",
+      actionUrl: "/twilio/collect",
+      mode: "dtmf",
+    });
 
-      if (!/^\d{1,6}$/.test(km)) {
-        sayAndGather({
-          twiml,
-          prompt: "Please enter mileage using numbers only. Example: 150000.",
-          actionUrl: "/twilio/collect",
-          mode: "dtmf",
-        });
-        res.type("text/xml");
-        return res.send(twiml.toString());
-      }
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
+
+  // normal flow
+  state.step = "model";
+  sayAndGather({
+    twiml,
+    prompt: "Please say the car model. For example, Civic, Corolla, or F one fifty.",
+    actionUrl: "/twilio/collect",
+    mode: "speech",
+  });
+  res.type("text/xml");
+  return res.send(twiml.toString());
+}
 
       const kmNum = parseInt(km, 10);
       if (isNaN(kmNum) || kmNum < 0 || kmNum > 800000) {
