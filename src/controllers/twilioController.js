@@ -124,6 +124,7 @@ export async function twilioCollect(req, res) {
         prompt: "Enter the car year using 4 digits. For example, 2012.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
+        numDigits: 4,
       });
       res.type("text/xml");
       return res.send(twiml.toString());
@@ -197,6 +198,7 @@ export async function twilioCollect(req, res) {
             "How much would you like to sell it for? You can enter digits like 500, or say the amount.",
           actionUrl: "/twilio/collect",
           mode: "both",
+          finishOnKey: "#",
         });
 
         res.type("text/xml");
