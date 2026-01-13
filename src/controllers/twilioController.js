@@ -5,10 +5,8 @@ import { YARD_POSTAL, KNOWN_CITIES } from "../config/constants.js";
 import { getDrivingDistanceKm } from "../services/distanceMatrix.js";
 import { normalizeCity } from "../utils/city.js";
 import { writeLeadToSheet } from "../services/googleSheets.js";
-
 import { getOrCreateState, deleteState } from "../state/callState.js";
 import { pickUserInput, sayAndGather, endCallAndCleanup } from "../twilio/twimlHelpers.js";
-
 import {
   isOldNonDrivableEligible,
   getInitialOffer,
