@@ -17,6 +17,16 @@ import {
   parseDesiredPrice,
 } from "../../offerRules.js";
 
+function isEarlyToyotaHondaOldNonDrive({ drives, year, make }) {
+  const y = parseInt(year, 10);
+  if (drives !== false) return false;
+  if (Number.isNaN(y) || y > 2001) return false;
+
+  const m = String(make || "").toLowerCase();
+  return /\btoyota\b/.test(m) || /\bhonda\b/.test(m);
+}
+
+
 // ----- PRICING LOGIC (keep same for now) -----
 function calculatePriceRange({ drives, year, location, distanceKm }) {
   let min = drives ? 300 : 120;
