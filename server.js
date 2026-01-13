@@ -1,23 +1,23 @@
 import express from "express";
-import { validateTwilioRequest } from "./src/middleware/validateTwilio.js";
 import bodyParser from "body-parser";
+import twilio from "twilio";
+
+import { validateTwilioRequest } from "./src/middleware/validateTwilio.js";
 import { PORT, YARD_POSTAL, KNOWN_CITIES } from "./src/config/constants.js";
 import { getDrivingDistanceKm } from "./src/services/distanceMatrix.js";
 import { normalizeCity } from "./src/utils/city.js";
 import { writeLeadToSheet } from "./src/services/googleSheets.js";
 import { extractPostalCodeFromSpeech } from "./src/utils/postal.js";
-import twilio from "twilio";
+
+import { getOrCreateState, deleteState } from "./src/state/callState.js";
+import { pickUserInput, sayAndGather, endCallAndCleanup } from "./src/twilio/twimlHelpers.js";
+
 import {
   isOldNonDrivableEligible,
   getInitialOffer,
   evaluateCounterOffer,
-  needsManagerReview,
   parseDesiredPrice,
 } from "./offerRules.js";
-
-// If your Node runtime doesn't have global fetch (Node < 18), uncomment below:
-// import fetch from "node-fetch";
-
 
 // ----- PRICING LOGIC (basic placeholder tiers) -----
 function calculatePriceRange({ drives, year, location, distanceKm }) {
@@ -35,7 +35,6 @@ function calculatePriceRange({ drives, year, location, distanceKm }) {
     }
   }
 
-  // Distance impact (simple tiers)
   if (typeof distanceKm === "number" && !isNaN(distanceKm)) {
     if (distanceKm <= 15) {
       min += 25;
@@ -51,9 +50,12 @@ function calculatePriceRange({ drives, year, location, distanceKm }) {
     }
   }
 
-  // Light location adjustment
   const loc = (location || "").toLowerCase();
-  if (/vancouver|richmond|north vancouver|coquitlam|burnaby|new westminster|delta/.test(loc)) {
+  if (
+    /vancouver|richmond|north vancouver|coquitlam|burnaby|new westminster|delta/.test(
+      loc
+    )
+  ) {
     min -= 10;
     max -= 10;
   }
@@ -62,35 +64,6 @@ function calculatePriceRange({ drives, year, location, distanceKm }) {
   max = Math.max(max, min + 50);
 
   return { min: Math.round(min), max: Math.round(max) };
-}
-
-
-// ----- Twilio helpers -----
-function pickUserInput(req) {
-  return {
-    speech: (req.body.SpeechResult || "").trim(),
-    digits: (req.body.Digits || "").trim(),
-  };
-}
-
-function sayAndGather({ twiml, prompt, actionUrl, mode, hints }) {
-  const input = mode === "dtmf" ? "dtmf" : mode === "speech" ? "speech" : "dtmf speech";
-
-  const gather = twiml.gather({
-    input,
-    action: actionUrl,
-    method: "POST",
-    timeout: 7,
-    speechTimeout: "auto",
-    language: "en-CA",
-    hints: hints || "",
-  });
-
-  gather.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, prompt);
-
-  // If gather times out, Twilio continues and will run these:
-  twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, "Sorry, I did not get that.");
-  twiml.redirect({ method: "POST" }, actionUrl);
 }
 
 // ----- EXPRESS APP -----
@@ -103,66 +76,9 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.status(200).send("CashCarBC backend is running.\n"));
-
-// ----- Call state -----
-const callState = new Map();
-
-function getOrCreateState(callSid, req) {
-  if (!callState.has(callSid)) {
-    callState.set(callSid, {
-      // flow control
-      step: "drives",
-
-      // call metadata
-      from: req.body.From || "",
-      to: req.body.To || "",
-      callSid,
-      timestamp: new Date().toISOString(),
-
-      // vehicle basics
-      drives: null,
-      year: "",
-      make: "",
-      model: "",
-      mileageKm: "",
-      askingPrice: "",
-
-      // location
-      cityRaw: "",
-      cityNorm: "",
-      cityScore: 0,
-      pickupPostal: "",
-      distanceKm: null,
-
-      // condition
-      condition: "",
-
-      // pricing / rules
-      ruleApplied: "N/A",
-
-      // ===== AUTO-OFFER FLOW (old non-drivable cars) =====
-      autoOfferEligible: false,
-      autoOfferInitial: "",       // e.g. "300"
-      autoOfferFinal: "",         // e.g. "300" or "350"
-      autoOfferStatus: "",        // ACCEPTED_300 / ACCEPTED_COUNTER / MANAGER_REVIEW / DECLINED
-
-      desiredPrice: "",
-
-      // callback handling
-      callbackBestNumber: "Yes",
-      callbackNumber: "",
-    });
-  }
-  return callState.get(callSid);
-}
-
-function endCallAndCleanup(res, twiml, callSid) {
-  twiml.hangup();
-  callState.delete(callSid);
-  res.type("text/xml");
-  return res.send(twiml.toString());
-}
+app.get("/", (req, res) =>
+  res.status(200).send("CashCarBC backend is running.\n")
+);
 
 // ----- START CALL -----
 app.post("/twilio/voice", validateTwilioRequest, async (req, res) => {
@@ -194,7 +110,9 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
   const state = getOrCreateState(callSid, req);
   const { speech, digits } = pickUserInput(req);
 
-  console.log(`[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`);
+  console.log(
+    `[COLLECT] CallSid=${callSid} step=${state.step} digits=${digits} speech="${speech}"`
+  );
 
   try {
     // 1) drives
@@ -543,10 +461,8 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
 
       state.condition = speech;
 
-      // ===== AUTO-OFFER CHECK (this is what you were missing) =====
-      // Decide eligibility based on your rules file
       state.autoOfferEligible = isOldNonDrivableEligible({
-        drives: Boolean(state.drives),
+        drives: state.drives,
         year: state.year,
         condition: state.condition,
         make: state.make,
@@ -559,7 +475,7 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
       if (state.autoOfferEligible) {
         const initial = String(getInitialOffer({ year: state.year }) ?? "300");
         state.autoOfferInitial = initial;
-        state.autoOfferFinal = ""; // not decided yet
+        state.autoOfferFinal = "";
         state.autoOfferStatus = "";
 
         state.step = "auto_offer_present";
@@ -573,7 +489,6 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
         return res.send(twiml.toString());
       }
 
-      // ===== Normal range path =====
       const { min, max } = calculatePriceRange({
         drives: Boolean(state.drives),
         year: state.year,
@@ -583,10 +498,16 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
 
       state.priceText = `$${min} to $${max}`;
 
-      try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
       const distPhrase =
-        typeof state.distanceKm === "number" ? ` about ${state.distanceKm} kilometers away` : "";
+        typeof state.distanceKm === "number"
+          ? ` about ${state.distanceKm} kilometers away`
+          : "";
 
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
@@ -600,30 +521,35 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
         "A human will confirm the final offer shortly. Goodbye."
       );
 
-      return endCallAndCleanup(res, twiml, callSid);
+      return endCallAndCleanup({ res, twiml, callSid, deleteState });
     }
 
-    // 10) auto_offer_present: accept 300 or counter
+    // 10) auto_offer_present
     if (state.step === "auto_offer_present") {
       if (digits === "1") {
-        state.autoOfferFinal = state.autoOfferInitial; // accept 300
+        state.autoOfferFinal = state.autoOfferInitial;
         state.autoOfferStatus = "ACCEPTED_300";
         state.ruleApplied = "AutoOfferAccepted";
 
-        try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
           `Perfect. We have accepted $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
         );
-        return endCallAndCleanup(res, twiml, callSid);
+        return endCallAndCleanup({ res, twiml, callSid, deleteState });
       }
 
       if (digits === "2") {
         state.step = "auto_offer_counter";
         sayAndGather({
           twiml,
-          prompt: "Okay. What price would you accept? Enter the amount in dollars, numbers only. For example, 350.",
+          prompt:
+            "Okay. What price would you accept? Enter the amount in dollars, numbers only. For example, 350.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -641,122 +567,121 @@ app.post("/twilio/collect", validateTwilioRequest, async (req, res) => {
       return res.send(twiml.toString());
     }
 
-  // 11) auto_offer_counter: parse desired price and decide (this is where $350 gets accepted)
-if (state.step === "auto_offer_counter") {
-  const parsed = parseDesiredPrice(digits);
+    // 11) auto_offer_counter
+    if (state.step === "auto_offer_counter") {
+      const parsed = parseDesiredPrice(digits);
 
-  // Your offerRules.parseDesiredPrice returns { ok, value, raw }
-  if (!parsed?.ok) {
-    sayAndGather({
-      twiml,
-      prompt:
-        "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
-      actionUrl: "/twilio/collect",
-      mode: "dtmf",
-    });
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
+      if (!parsed?.ok) {
+        sayAndGather({
+          twiml,
+          prompt:
+            "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
 
-  const desiredValue = parsed.value;
-  state.desiredPrice = String(desiredValue);
+      const desiredValue = parsed.value;
+      state.desiredPrice = String(desiredValue);
 
-  // Correct call signature for your offerRules.js
-  const decision = evaluateCounterOffer({
-    make: state.make,
-    desiredPrice: desiredValue,
-  });
+      const decision = evaluateCounterOffer({
+        make: state.make,
+        desiredPrice: desiredValue,
+      });
 
-  if (!decision?.ok) {
-    sayAndGather({
-      twiml,
-      prompt:
-        "Sorry, I could not process that offer. Please enter your price again, for example 350.",
-      actionUrl: "/twilio/collect",
-      mode: "dtmf",
-    });
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
+      if (!decision?.ok) {
+        sayAndGather({
+          twiml,
+          prompt:
+            "Sorry, I could not process that offer. Please enter your price again, for example 350.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
 
-  // If user asked above cap, decision.finalOffer will be maxOffer (300 or 350)
-  const proposedFinal = Number(decision.finalOffer);
+      const proposedFinal = Number(decision.finalOffer);
 
-  // If they asked ABOVE cap, we should present the capped offer and ask to accept it.
-  if (decision.decision === "CAP_AT_MAX") {
-    state.autoOfferFinal = String(proposedFinal);
-    state.autoOfferStatus = "COUNTERED_AT_MAX";
-    state.ruleApplied = "AutoOfferCappedToMax";
+      if (decision.decision === "CAP_AT_MAX") {
+        state.autoOfferFinal = String(proposedFinal);
+        state.autoOfferStatus = "COUNTERED_AT_MAX";
+        state.ruleApplied = "AutoOfferCappedToMax";
 
-    state.step = "auto_offer_cap_confirm";
-    sayAndGather({
-      twiml,
-      prompt: `The best we can do is $${state.autoOfferFinal}. Press 1 to accept. Press 2 to reject.`,
-      actionUrl: "/twilio/collect",
-      mode: "dtmf",
-    });
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
+        state.step = "auto_offer_cap_confirm";
+        sayAndGather({
+          twiml,
+          prompt: `The best we can do is $${state.autoOfferFinal}. Press 1 to accept. Press 2 to reject.`,
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
 
-  // If desired <= maxOffer (e.g., Toyota/Honda desired=350), accept immediately
-  state.autoOfferFinal = String(proposedFinal);
-  state.autoOfferStatus = "ACCEPTED_COUNTER";
-  state.ruleApplied = "AutoOfferCounterAccepted";
+      state.autoOfferFinal = String(proposedFinal);
+      state.autoOfferStatus = "ACCEPTED_COUNTER";
+      state.ruleApplied = "AutoOfferCounterAccepted";
 
-  try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
-  twiml.say(
-    { voice: "Polly-Matthew-Neural", language: "en-CA" },
-    `Okay. We can do $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
-  );
-  return endCallAndCleanup(res, twiml, callSid);
-}
+      twiml.say(
+        { voice: "Polly-Matthew-Neural", language: "en-CA" },
+        `Okay. We can do $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
+      );
+      return endCallAndCleanup({ res, twiml, callSid, deleteState });
+    }
 
-    // 11b) auto_offer_cap_confirm: user accepts/rejects capped max offer
-if (state.step === "auto_offer_cap_confirm") {
-  if (digits === "1") {
-    // accepted capped offer (e.g., $350)
-    state.autoOfferStatus = "ACCEPTED_MAX";
-    state.ruleApplied = "AutoOfferMaxAccepted";
+    // 11b) auto_offer_cap_confirm
+    if (state.step === "auto_offer_cap_confirm") {
+      if (digits === "1") {
+        state.autoOfferStatus = "ACCEPTED_MAX";
+        state.ruleApplied = "AutoOfferMaxAccepted";
 
-    try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
-    twiml.say(
-      { voice: "Polly-Matthew-Neural", language: "en-CA" },
-      `Perfect. We have accepted $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
-    );
-    return endCallAndCleanup(res, twiml, callSid);
-  }
+        twiml.say(
+          { voice: "Polly-Matthew-Neural", language: "en-CA" },
+          `Perfect. We have accepted $${state.autoOfferFinal}. A human will confirm pickup details shortly. Goodbye.`
+        );
+        return endCallAndCleanup({ res, twiml, callSid, deleteState });
+      }
 
-  if (digits === "2") {
-    // rejected final offer -> manager review needed
-    state.autoOfferStatus = "MANAGER_REVIEW";
-    state.ruleApplied = "AutoOfferRejectedFinal";
+      if (digits === "2") {
+        state.autoOfferStatus = "MANAGER_REVIEW";
+        state.ruleApplied = "AutoOfferRejectedFinal";
 
-    state.step = "callback_best_number";
-    sayAndGather({
-      twiml,
-      prompt:
-        "No problem. We'll have a manager review this and call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
-      actionUrl: "/twilio/collect",
-      mode: "dtmf",
-    });
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
+        state.step = "callback_best_number";
+        sayAndGather({
+          twiml,
+          prompt:
+            "No problem. We'll have a manager review this and call you back soon. Is this the best number to call you back on? Press 1 for yes. Press 2 to enter a different number.",
+          actionUrl: "/twilio/collect",
+          mode: "dtmf",
+        });
+        res.type("text/xml");
+        return res.send(twiml.toString());
+      }
 
-  sayAndGather({
-    twiml,
-    prompt: "Press 1 to accept, or press 2 to reject.",
-    actionUrl: "/twilio/collect",
-    mode: "dtmf",
-  });
-  res.type("text/xml");
-  return res.send(twiml.toString());
-}
-
-
+      sayAndGather({
+        twiml,
+        prompt: "Press 1 to accept, or press 2 to reject.",
+        actionUrl: "/twilio/collect",
+        mode: "dtmf",
+      });
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
 
     // 12) callback_best_number
     if (state.step === "callback_best_number") {
@@ -764,13 +689,17 @@ if (state.step === "auto_offer_cap_confirm") {
         state.callbackBestNumber = "Yes";
         state.callbackNumber = "";
 
-        try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+        try {
+          await writeLeadToSheet(state);
+        } catch (err) {
+          console.error("Sheet append failed:", err);
+        }
 
         twiml.say(
           { voice: "Polly-Matthew-Neural", language: "en-CA" },
           "Great. We'll call you back shortly. Goodbye."
         );
-        return endCallAndCleanup(res, twiml, callSid);
+        return endCallAndCleanup({ res, twiml, callSid, deleteState });
       }
 
       if (digits === "2") {
@@ -778,7 +707,8 @@ if (state.step === "auto_offer_cap_confirm") {
         state.step = "callback_number";
         sayAndGather({
           twiml,
-          prompt: "Please enter the best callback number now, including area code. Numbers only.",
+          prompt:
+            "Please enter the best callback number now, including area code. Numbers only.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -802,7 +732,8 @@ if (state.step === "auto_offer_cap_confirm") {
       if (n.length < 10 || n.length > 15) {
         sayAndGather({
           twiml,
-          prompt: "That number seems invalid. Please enter the callback number again, numbers only.",
+          prompt:
+            "That number seems invalid. Please enter the callback number again, numbers only.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -812,13 +743,17 @@ if (state.step === "auto_offer_cap_confirm") {
 
       state.callbackNumber = n;
 
-      try {   await writeLeadToSheet(state); } catch (err) {   console.error("Sheet append failed:", err); }
+      try {
+        await writeLeadToSheet(state);
+      } catch (err) {
+        console.error("Sheet append failed:", err);
+      }
 
       twiml.say(
         { voice: "Polly-Matthew-Neural", language: "en-CA" },
         "Thanks. We'll call you back shortly. Goodbye."
       );
-      return endCallAndCleanup(res, twiml, callSid);
+      return endCallAndCleanup({ res, twiml, callSid, deleteState });
     }
 
     // Fallback
@@ -826,14 +761,14 @@ if (state.step === "auto_offer_cap_confirm") {
       { voice: "Polly-Matthew-Neural", language: "en-CA" },
       "Sorry, something went wrong. Please call again."
     );
-    return endCallAndCleanup(res, twiml, callSid);
+    return endCallAndCleanup({ res, twiml, callSid, deleteState });
   } catch (err) {
     console.error("Error in /twilio/collect:", err);
     twiml.say(
       { voice: "Polly-Matthew-Neural", language: "en-CA" },
       "Sorry, we had a system error. Please call again later."
     );
-    return endCallAndCleanup(res, twiml, callSid);
+    return endCallAndCleanup({ res, twiml, callSid, deleteState });
   }
 });
 
