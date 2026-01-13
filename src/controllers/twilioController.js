@@ -190,11 +190,13 @@ export async function twilioCollect(req, res) {
         state.ruleApplied = "EarlyToyotaHondaOldNonDrive";
         state.step = "early_ask_price";
 
+        // IMPORTANT: allow DTMF or speech
         sayAndGather({
           twiml,
-          prompt: "How much would you like to sell it for? Enter the amount in dollars, numbers only. For example, 250.",
+          prompt:
+            "How much would you like to sell it for? You can enter digits like 500, or say the amount.",
           actionUrl: "/twilio/collect",
-          mode: "dtmf",
+          mode: "both",
         });
 
         res.type("text/xml");
@@ -217,14 +219,17 @@ export async function twilioCollect(req, res) {
     // If below 300 => accept
     // Otherwise => offer 350, then if reject => manager callback flow
     if (state.step === "early_ask_price") {
-      const parsed = parseDesiredPrice(digits);
+      // Parse from digits first, else speech (fixes your “dialed 500” issue)
+      const rawInput = (digits && digits.trim()) ? digits.trim() : (speech || "").trim();
+      const parsed = parseDesiredPrice(rawInput);
 
       if (!parsed?.ok) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 250.",
+          prompt:
+            "Sorry, I could not read that amount. Please enter digits like 250 or 500.",
           actionUrl: "/twilio/collect",
-          mode: "dtmf",
+          mode: "both",
         });
         res.type("text/xml");
         return res.send(twiml.toString());
@@ -319,6 +324,7 @@ export async function twilioCollect(req, res) {
       }
 
       state.model = speech;
+
       state.step = "mileage";
       sayAndGather({
         twiml,
@@ -362,7 +368,8 @@ export async function twilioCollect(req, res) {
       state.step = "asking_price";
       sayAndGather({
         twiml,
-        prompt: "How much are you trying to sell the car for? Enter the amount in dollars, numbers only. For example, enter 1200.",
+        prompt:
+          "How much are you trying to sell the car for? Enter the amount in dollars, numbers only. For example, enter 1200.",
         actionUrl: "/twilio/collect",
         mode: "dtmf",
       });
@@ -390,7 +397,8 @@ export async function twilioCollect(req, res) {
       state.step = "city";
       sayAndGather({
         twiml,
-        prompt: "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
+        prompt:
+          "Please say your pickup city. For example, Surrey, Vancouver, Abbotsford, or Langley.",
         actionUrl: "/twilio/collect",
         mode: "speech",
         hints: KNOWN_CITIES.join(", "),
@@ -460,7 +468,8 @@ export async function twilioCollect(req, res) {
       state.step = "postal";
       sayAndGather({
         twiml,
-        prompt: "To estimate distance, please say your postal code. For example, V six V one M seven.",
+        prompt:
+          "To estimate distance, please say your postal code. For example, V six V one M seven.",
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
@@ -475,7 +484,8 @@ export async function twilioCollect(req, res) {
       if (!parsed.ok) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
+          prompt:
+            "Sorry, I could not understand the postal code. Please say it again, for example, V six V one M seven.",
           actionUrl: "/twilio/collect",
           mode: "speech",
         });
@@ -533,7 +543,8 @@ export async function twilioCollect(req, res) {
       state.step = "condition";
       sayAndGather({
         twiml,
-        prompt: "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
+        prompt:
+          "Briefly describe the condition. For example, accident damage, engine issue, fire damage, or normal wear.",
         actionUrl: "/twilio/collect",
         mode: "speech",
       });
@@ -631,7 +642,8 @@ export async function twilioCollect(req, res) {
         state.step = "auto_offer_counter";
         sayAndGather({
           twiml,
-          prompt: "Okay. What price would you accept? Enter the amount in dollars, numbers only. For example, 350.",
+          prompt:
+            "Okay. What price would you accept? Enter the amount in dollars, numbers only. For example, 350.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -656,7 +668,8 @@ export async function twilioCollect(req, res) {
       if (!parsed?.ok) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
+          prompt:
+            "Sorry, I could not read that amount. Please enter the amount in dollars. For example, 350.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
@@ -675,7 +688,8 @@ export async function twilioCollect(req, res) {
       if (!decision?.ok) {
         sayAndGather({
           twiml,
-          prompt: "Sorry, I could not process that offer. Please enter your price again, for example 350.",
+          prompt:
+            "Sorry, I could not process that offer. Please enter your price again, for example 350.",
           actionUrl: "/twilio/collect",
           mode: "dtmf",
         });
