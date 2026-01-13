@@ -1,63 +1,55 @@
 // src/twilio/twimlHelpers.js
 
 export function pickUserInput(req) {
+  const rawSpeech = (req.body.SpeechResult || "").trim();
+  const rawDigits = (req.body.Digits || "").trim();
+
+  // IMPORTANT: Twilio may include finishOnKey chars or spaces in Digits depending on config
+  // Always sanitize to digits-only for numeric fields.
+  const digitsOnly = rawDigits.replace(/[^\d]/g, "");
+
   return {
-    speech: (req.body.SpeechResult || "").trim(),
-    digits: (req.body.Digits || "").trim(),
+    speech: rawSpeech,
+    digits: digitsOnly,      // always digits-only
+    rawDigits,               // keep for logging/debugging if needed
   };
 }
 
-/**
- * sayAndGather
- * - mode: "dtmf" | "speech" | "both"
- * - numDigits: number (optional) -> for fixed-length DTMF (e.g., year=4)
- * - finishOnKey: string (optional) -> for variable-length DTMF (e.g., price/mileage; caller presses #)
- */
 export function sayAndGather({
   twiml,
   prompt,
   actionUrl,
-  mode = "dtmf",
+  mode,
   hints,
-  numDigits,
-  finishOnKey,
-  timeout = 7,
+  // NEW optional options:
+  finishOnKey,   // e.g. "#"
+  numDigits,     // e.g. 4 for year
+  timeoutSec,    // default longer
 }) {
   const input =
-    mode === "dtmf" ? "dtmf" : mode === "speech" ? "speech" : "dtmf speech";
+    mode === "dtmf" ? "dtmf" :
+    mode === "speech" ? "speech" :
+    "dtmf speech";
 
-  const gatherOptions = {
+  const gatherOpts = {
     input,
     action: actionUrl,
     method: "POST",
-    timeout,
+    timeout: Number.isFinite(timeoutSec) ? timeoutSec : 12, // longer than 7
     speechTimeout: "auto",
     language: "en-CA",
   };
 
-  // Only include hints when using speech (Twilio ignores for pure DTMF anyway)
-  if (mode !== "dtmf" && hints) gatherOptions.hints = hints;
+  if (hints) gatherOpts.hints = hints;
+  if (finishOnKey) gatherOpts.finishOnKey = finishOnKey;
+  if (Number.isFinite(numDigits)) gatherOpts.numDigits = numDigits;
 
-  // For fixed-length numeric inputs (e.g., year=4, drives=1 digit)
-  if (typeof numDigits === "number" && Number.isFinite(numDigits) && numDigits > 0) {
-    gatherOptions.numDigits = numDigits;
-  }
-
-  // For variable-length numeric inputs (e.g., price/mileage/phone)
-  // Caller presses # to submit.
-  if (typeof finishOnKey === "string" && finishOnKey.length > 0) {
-    gatherOptions.finishOnKey = finishOnKey;
-  }
-
-  const gather = twiml.gather(gatherOptions);
+  const gather = twiml.gather(gatherOpts);
 
   gather.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, prompt);
 
-  // If gather times out, Twilio continues and will run these:
-  twiml.say(
-    { voice: "Polly-Matthew-Neural", language: "en-CA" },
-    "Sorry, I did not get that."
-  );
+  // Only runs when NO input was captured
+  twiml.say({ voice: "Polly-Matthew-Neural", language: "en-CA" }, "Sorry, I did not get that.");
   twiml.redirect({ method: "POST" }, actionUrl);
 }
 
